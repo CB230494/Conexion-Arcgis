@@ -1,9 +1,7 @@
-streamlit==1.37.1
-pandas==2.2.2
-requests==2.32.3
-pydeck==0.9.1
+
 folium==0.17.0
-streamlit-folium==0.20.0
+
+
 
 
 

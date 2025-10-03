@@ -29,16 +29,30 @@ st.sidebar.caption(f"ItemID: {ITEM_ID} | Layer: {LAYER_INDEX}")
 # -------------------------------------------------
 # Funciones REST ArcGIS
 # -------------------------------------------------
-def get_token(portal=PORTAL, username=USER, password=PWD):
-    url = f"{portal}/sharing/rest/generateToken"
-    data = {"username": username, "password": password,
-            "referer": "https://streamlit.io", "f": "json"}
+def get_token(portal=PORTAL, username=USER, password=PWD, referer="https://streamlit.io"):
+    """
+    Genera token de ArcGIS Online con username/password.
+    Importante: incluir client=referer y referer, y manejar errores.
+    """
+    url = f"{portal.rstrip('/')}/sharing/rest/generateToken"
+    data = {
+        "f": "json",
+        "username": username,
+        "password": password,
+        "client": "referer",           # <— clave
+        "referer": referer,            # <— clave
+        "expiration": 60               # minutos
+    }
     r = requests.post(url, data=data, timeout=30)
     r.raise_for_status()
     js = r.json()
-    if "token" not in js:
-        raise RuntimeError(f"No se pudo generar token: {js}")
-    return js["token"]
+    if "token" in js:
+        return js["token"]
+    # mostrar mensaje claro en la UI
+    err_txt = js.get("error", js)
+    st.error(f"Token error: {err_txt}")
+    raise RuntimeError(f"No se pudo generar token: {js}")
+
 
 def get_item_info(portal, item_id, token):
     url = f"{portal}/sharing/rest/content/items/{item_id}"
@@ -270,3 +284,4 @@ if not dups.empty:
     st.download_button("Descargar duplicados.xlsx", data=dups.to_excel(index=False), file_name="duplicados.xlsx")
 else:
     st.info("No hay duplicados detectados con la lógica actual.")
+

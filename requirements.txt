@@ -1,10 +1,11 @@
-streamlit==1.37.1
-pandas==2.2.2
-pydeck==0.9.1
-streamlit-folium==0.20.0
-folium==0.17.0
-arcgis==2.3.0
-python-dotenv==1.0.1
+streamlit
+pandas
+pydeck
+streamlit-folium
+folium
+arcgis
+python-dotenv
+
 
 
 

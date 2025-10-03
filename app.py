@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-import json, math, hashlib, time
-import requests
+import requests, math, hashlib
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -8,104 +7,42 @@ import folium
 from streamlit_folium import st_folium
 
 # =========================
-# Lectura de secrets (modo password)
+# Config
 # =========================
-st.set_page_config(page_title="Dashboard Encuesta Seguridad", layout="wide")
+st.set_page_config(page_title="Dashboard Encuesta Seguridad (Solo lectura)", layout="wide")
 
-AGOL = st.secrets.get("agol", {})
-PORTAL      = AGOL.get("org_url", "https://www.arcgis.com").rstrip("/")
-USER        = AGOL.get("username", "")
-PWD         = AGOL.get("password", "")
-ITEM_ID     = AGOL.get("item_id", "")
-LAYER_INDEX = int(AGOL.get("layer_index", 0))
+PUB = st.secrets.get("agol_public", {})
+LAYER_URL = PUB.get("feature_layer_url", "").rstrip("/")
 
-if not (USER and PWD and ITEM_ID):
-    st.error("Faltan claves en secrets.toml → [agol] org_url, username, password, item_id, layer_index")
+if not LAYER_URL.endswith("/FeatureServer/0") and "/FeatureServer/" not in LAYER_URL:
+    st.error("Revisa secrets: [agol_public] feature_layer_url debe ser la URL del servicio y terminar en /FeatureServer/0")
     st.stop()
 
-st.sidebar.success(f"Portal: {PORTAL}")
-st.sidebar.caption(f"ItemID: {ITEM_ID} | Layer: {LAYER_INDEX}")
-st.sidebar.caption(f"Usuario: {USER}")
+st.sidebar.success("Modo: Solo lectura (sin token)")
+st.sidebar.caption(LAYER_URL)
 
 # =========================
-# Helpers AGO REST
+# REST helpers (sin token)
 # =========================
-def get_token(portal=PORTAL, username=USER, password=PWD, referer="https://streamlit.io"):
-    """Genera token de AGO usando username/password.
-       Requiere client=referer + referer."""
-    url = f"{portal}/sharing/rest/generateToken"
-    data = {
-        "f": "json",
-        "username": username,
-        "password": password,
-        "client": "referer",
-        "referer": referer,
-        "expiration": 60
-    }
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    if "token" in js:
-        return js["token"]
-    # Muestra error legible
-    err = js.get("error", js)
-    st.error(f"Token error: {err}")
-    raise RuntimeError(f"No se pudo generar token: {js}")
-
-def get_item_info(portal, item_id, token):
-    url = f"{portal}/sharing/rest/content/items/{item_id}"
-    r = requests.get(url, params={"f":"json","token":token}, timeout=30)
+def layer_metadata(layer_url):
+    r = requests.get(layer_url, params={"f":"json"}, timeout=60)
     r.raise_for_status()
     return r.json()
 
-def get_layer_url_from_item(portal, item_id, layer_index, token):
-    """Devuelve .../FeatureServer/{layer_index} a partir del item_id."""
-    info = get_item_info(portal, item_id, token)
-    service_url = info.get("url")
-    if not service_url:
-        # último recurso: /data
-        r = requests.get(f"{portal}/sharing/rest/content/items/{item_id}/data",
-                         params={"f":"json","token":token}, timeout=30)
-        if r.ok:
-            data = r.json()
-            service_url = data.get("url") or data.get("serviceItemId")
-    if not service_url:
-        raise RuntimeError("No se pudo resolver la URL del servicio desde el item.")
-    return f"{service_url.rstrip('/')}/{layer_index}"
-
-def layer_metadata(layer_url, token):
-    r = requests.get(layer_url, params={"f":"json","token":token}, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def query_layer(layer_url, token, where="1=1", out_fields="*", return_geom=True):
+def query_layer(layer_url, where="1=1", out_fields="*", return_geom=True):
     params = {
         "f":"json",
         "where": where,
         "outFields": out_fields,
         "outSR": 4326,
-        "returnGeometry": str(return_geom).lower(),
-        "token": token
+        "returnGeometry": str(return_geom).lower()
     }
     r = requests.get(f"{layer_url}/query", params=params, timeout=90)
     r.raise_for_status()
     return r.json()
 
-def apply_updates(layer_url, token, updates):
-    # updates = [{"attributes": {OID: 1, "campo": "valor", ...}}, ...]
-    data = {"f":"json", "updates": json.dumps(updates), "token": token}
-    r = requests.post(f"{layer_url}/applyEdits", data=data, timeout=90)
-    r.raise_for_status()
-    return r.json()
-
-def delete_features(layer_url, token, object_ids):
-    data = {"f":"json", "objectIds": ",".join(map(str, object_ids)), "token": token}
-    r = requests.post(f"{layer_url}/deleteFeatures", data=data, timeout=90)
-    r.raise_for_status()
-    return r.json()
-
 # =========================
-# Utilidades duplicados
+# Duplicados helpers
 # =========================
 def norm(v):
     if v is None: return ""
@@ -130,20 +67,18 @@ def build_dup_key(row, campos, usar_dia=True, round_coords=5):
     return hashlib.md5(raw.encode("utf-8")).hexdigest() if raw else ""
 
 # =========================
-# Conexión y datos
+# Cargar metadatos y datos
 # =========================
-with st.spinner("Conectando a ArcGIS..."):
-    TOKEN = get_token()
-    LAYER_URL = get_layer_url_from_item(PORTAL, ITEM_ID, LAYER_INDEX, TOKEN)
-    meta = layer_metadata(LAYER_URL, TOKEN)
-    OID = meta.get("objectIdField", "OBJECTID")
-    item_title = get_item_info(PORTAL, ITEM_ID, TOKEN).get("title", "Capa")
+meta = layer_metadata(LAYER_URL)
+OID = meta.get("objectIdField", "OBJECTID")
+title = meta.get("name", "Capa")
 
-st.success(f"Conectado a: {item_title}")
+st.success(f"Conectado a: {title}")
 st.sidebar.info(f"OID: {OID}")
 
-resp = query_layer(LAYER_URL, TOKEN, where="1=1", out_fields="*", return_geom=True)
+resp = query_layer(LAYER_URL, out_fields="*", return_geom=True)
 features = resp.get("features", [])
+
 if not features:
     st.warning("No hay registros en la capa.")
     st.stop()
@@ -155,20 +90,21 @@ for f in features:
     atr["x"] = geo.get("x")
     atr["y"] = geo.get("y")
     rows.append(atr)
+
 df = pd.DataFrame(rows)
 total = len(df)
 
 # =========================
 # Parámetros de duplicados (UI)
 # =========================
-st.sidebar.header("Duplicados")
+st.sidebar.header("Detección de duplicados")
 base_fields = ["seguridad_general","tipo_incidente","factores","frecuencia","contacto"]
 default_list = [c for c in base_fields if c in df.columns]
 campos = st.sidebar.multiselect("Campos clave", options=sorted(df.columns), default=default_list)
 usar_dia = st.sidebar.toggle("Usar día (CreationDate)", value=True)
 redondeo = st.sidebar.slider("Redondeo coords", 0, 7, 5)
 
-# Clave dup (si capa no trae dup_key)
+# Calcular clave si la capa no trae dup_key
 if "dup_key" not in df.columns or df["dup_key"].isna().all():
     df["_dup_key_calc"] = df.apply(lambda r: build_dup_key(r, campos, usar_dia, redondeo), axis=1)
     dup_key_col = "_dup_key_calc"
@@ -183,7 +119,7 @@ df["dup_group_calc"] = df[dup_key_col].fillna("").str[:8]
 # KPIs
 # =========================
 c1,c2,c3 = st.columns(3)
-c1.metric("Total", f"{total}")
+c1.metric("Total respuestas", f"{total}")
 c2.metric("Duplicadas", f"{int(df['dup_is_dup_calc'].sum())}")
 c3.metric("Válidas", f"{int((1-df['dup_is_dup_calc']).sum())}")
 
@@ -215,57 +151,24 @@ with tab2:
         st.info("Sin puntos para mostrar.")
 
 # =========================
-# Tabla + Edición
+# Tabla (solo lectura)
 # =========================
-st.subheader("Tabla")
+st.subheader("Tabla (solo lectura)")
 show_cols = [OID,"CreationDate","Creator","seguridad_general","tipo_incidente","factores","frecuencia","contacto", dup_key_col, "dup_is_dup_calc","dup_group_calc"]
 show_cols = [c for c in show_cols if c in df.columns]
-edit_cols = [c for c in ["seguridad_general","tipo_incidente","factores","frecuencia","contacto"] if c in df.columns]
 
-edited = st.data_editor(
-    df[show_cols], num_rows="dynamic", use_container_width=True,
-    disabled=[c for c in show_cols if c not in edit_cols], key="editor"
-)
+st.dataframe(df[show_cols], use_container_width=True)
 
-st.markdown("### Guardar ediciones")
-if st.button("Aplicar cambios a la capa", type="primary"):
-    try:
-        merged = edited.merge(df[[OID]+edit_cols], on=OID, suffixes=("_new","_old"))
-        ups = []
-        for _, r in merged.iterrows():
-            attrs = {OID: int(r[OID])}; changed = False
-            for c in edit_cols:
-                if r.get(f"{c}_new") != r.get(f"{c}_old"):
-                    attrs[c] = r.get(f"{c}_new"); changed = True
-            if changed:
-                ups.append({"attributes": attrs})
-        if ups:
-            res = apply_updates(LAYER_URL, TOKEN, ups)
-            st.success(f"Actualizados {len(ups)} registros.")
-        else:
-            st.info("No hay cambios para aplicar.")
-    except Exception as e:
-        st.error(f"Error al actualizar: {e}")
-
-st.markdown("### Eliminar por OID")
-oids_txt = st.text_input("OBJECTIDs (separados por coma)", value="")
-if st.button("Eliminar OIDs indicados", type="secondary"):
-    try:
-        ids = [int(x.strip()) for x in oids_txt.split(",") if x.strip().isdigit()]
-        if not ids:
-            st.warning("No ingresaste OIDs válidos.")
-        else:
-            res = delete_features(LAYER_URL, TOKEN, ids)
-            st.success(f"Eliminados {len(ids)} registros.")
-    except Exception as e:
-        st.error(f"Error al eliminar: {e}")
-
+# =========================
 # Exportar duplicados
+# =========================
 st.markdown("### Exportar duplicados a Excel")
 dups = df[df["dup_is_dup_calc"]==1].copy()
 if not dups.empty:
     st.download_button("Descargar duplicados.xlsx", data=dups.to_excel(index=False), file_name="duplicados.xlsx")
 else:
     st.info("No hay duplicados con la lógica actual.")
+
+st.caption("Modo lectura: edición y eliminación deshabilitadas por diseño.")
 
 

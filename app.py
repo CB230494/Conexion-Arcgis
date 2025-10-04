@@ -1,256 +1,337 @@
 # -*- coding: utf-8 -*-
-import json
-import math
+# app.py — Lector de encuestas ArcGIS / Survey123 (solo lectura)
+
 import re
+import json
+from io import BytesIO
+from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
-import streamlit as st
-import pandas as pd
 import requests
+import pandas as pd
+import streamlit as st
 
-# Mapa
 import folium
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Lectura de Encuestas ArcGIS (Solo lectura)", layout="wide")
+
+# =========================
+# Config UI
+# =========================
+st.set_page_config(page_title="Lectura de encuestas ArcGIS (Solo lectura)", layout="wide")
 st.title("📥 Lectura de encuestas ArcGIS / Survey123 (solo lectura)")
+st.caption("Compatible con ArcGIS Online y Enterprise. No escribe ni borra nada — solo lectura.")
 
-st.caption("Funciona con capas públicas o privadas (con token). No edita ni borra nada.")
+# =========================
+# Utilidades HTTP
+# =========================
+def _http_get(url: str, params: dict | None = None, timeout: int = 60) -> requests.Response:
+    r = requests.get(url, params=params, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r
 
-# ----------------- Utilidades -----------------
+def _http_post(url: str, data: dict | None = None, timeout: int = 60) -> requests.Response:
+    r = requests.post(url, data=data, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r
+
+def _json_or_raise_text(resp: requests.Response) -> dict:
+    """
+    ArcGIS devuelve HTML cuando no hay permisos o cuando la URL no es de REST.
+    Este helper evita 'Expecting value: line 1 column 1 (char 0)' y muestra el
+    texto crudo si no es JSON.
+    """
+    ctype = resp.headers.get("Content-Type", "")
+    txt = resp.text.strip()
+    try:
+        if "application/json" in ctype or txt.startswith("{") or txt.startswith("["):
+            j = resp.json()
+        else:
+            raise ValueError("Respuesta no es JSON")
+    except Exception:
+        # Devolver un error legible con un preview del contenido
+        preview = txt[:300].replace("\n", " ")
+        raise RuntimeError(f"La URL no devolvió JSON (posible falta de permisos o URL incorrecta). "
+                           f"Respuesta inicial: {preview}")
+    if isinstance(j, dict) and "error" in j:
+        raise RuntimeError(j["error"])
+    return j
+
+
+# =========================
+# Detectores y parsers
+# =========================
+FEATURE_RE = re.compile(r"/FeatureServer(?:/\d+)?/?$", re.IGNORECASE)
+
 def is_feature_layer_url(url: str) -> bool:
-    return bool(re.search(r"/FeatureServer(/\d+)?/?$", url))
+    return bool(FEATURE_RE.search(url.strip()))
 
 def clean_url(u: str) -> str:
     return u.strip().rstrip("/")
 
-def extract_item_id(item_or_short_url: str) -> str | None:
+def expand_arcgis_short(short_url: str) -> str:
+    """
+    Expande un arcg.is/xxxxx para obtener la URL final (generalmente item.html?id=...).
+    """
+    resp = _http_get(short_url)
+    return resp.url  # requests siguió la redirección
+
+def extract_item_id_from_url(url: str) -> Optional[str]:
+    """
+    Toma un URL tipo .../home/item.html?id=XXXXXXXX y devuelve el ID.
+    """
+    try:
+        q = parse_qs(urlparse(url).query)
+        return q.get("id", [None])[0]
+    except Exception:
+        return None
+
+def extract_item_id_any(s: str) -> Optional[str]:
     """
     Acepta:
-      - URL de item: .../home/item.html?id=XXXXXXXX...
-      - URL corta arcg.is/xxxxx (no resolvemos redirección desde aquí)
-      - ID directo de 32 caracteres
+      - ID de 32 chars (hex)
+      - URL de item (home/item.html?id=...)
+      - Enlace corto arcg.is/xxxxx (lo expande y toma el item)
     """
-    s = item_or_short_url.strip()
+    s = s.strip()
+    # ID directo
     if len(s) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", s):
         return s
+    # arcg.is corto
+    if "arcg.is/" in s:
+        expanded = expand_arcgis_short(s)
+        return extract_item_id_from_url(expanded)
+    # item largo
     if "item.html" in s:
-        q = parse_qs(urlparse(s).query)
-        return q.get("id", [None])[0]
-    if "arcg.is" in s:
-        # El corto redirige a un item; no podemos seguir redirección sin navegador.
-        # Pedimos que pegue el enlace largo de item, pero devolvemos None aquí.
-        return None
+        return extract_item_id_from_url(s)
     return None
 
-def gen_token(portal_base: str, username: str, password: str) -> str:
+
+# =========================
+# Token / Autenticación
+# =========================
+def guess_generate_token_endpoint(portal_base: str) -> str:
     """
-    Genera token con generateToken (referer). Soporta ArcGIS Online/Enterprise.
+    ArcGIS Online: token siempre en https://www.arcgis.com/sharing/rest/generateToken
+    Enterprise:    portal/sharing/rest/generateToken
     """
     portal = clean_url(portal_base)
-    if "arcgis.com" in portal:
-    url = "https://www.arcgis.com/sharing/rest/generateToken"
-else:
-    url = f"{portal}/sharing/rest/generateToken"
+    # Si es *.arcgis.com asumimos Online
+    if "arcgis.com" in urlparse(portal).netloc:
+        return "https://www.arcgis.com/sharing/rest/generateToken"
+    return f"{portal}/sharing/rest/generateToken"
+
+def generate_token(portal_base: str, username: str, password: str, referer: Optional[str] = None) -> str:
+    ep = guess_generate_token_endpoint(portal_base)
     data = {
         "username": username,
         "password": password,
         "client": "referer",
-        "referer": portal,
+        "referer": referer or portal_base,
         "f": "json",
         "expiration": 60  # minutos
     }
-    r = requests.post(url, data=data, timeout=30)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j["token"]
+    r = _http_post(ep, data=data, timeout=30)
+    j = _json_or_raise_text(r)
+    token = j.get("token")
+    if not token:
+        raise RuntimeError("No se obtuvo 'token' en la respuesta.")
+    return token
 
-def get_json(url: str, token: str | None = None, params: dict | None = None) -> dict:
+
+# =========================
+# REST helpers
+# =========================
+def get_json(url: str, token: Optional[str] = None, params: dict | None = None) -> dict:
     p = {"f": "json"}
     if params: p.update(params)
-    if token: p["token"] = token
-    r = requests.get(url, params=p, timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j
+    if token:  p["token"] = token
+    r = _http_get(url, params=p)
+    return _json_or_raise_text(r)
 
-def post_json(url: str, token: str | None = None, data: dict | None = None) -> dict:
+def post_json(url: str, token: Optional[str] = None, data: dict | None = None) -> dict:
     d = {"f": "json"}
-    if data: d.update(data)
+    if data:  d.update(data)
     if token: d["token"] = token
-    r = requests.post(url, data=d, timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(j["error"])
-    return j
+    r = _http_post(url, data=d)
+    return _json_or_raise_text(r)
 
-def resolve_featurelayer_from_item(portal_base: str, item_id: str, token: str | None) -> str:
+
+# =========================
+# Resolución de capa desde Item
+# =========================
+def resolve_featurelayer_from_item(portal_base: str, item_id: str, token: Optional[str]) -> str:
     """
-    Dado un item (Survey o Feature Service), encontramos la URL de FeatureServer/0
-    - Si el item YA es un Feature Service, devuelve su URL.
-    - Si es Survey123, buscamos la capa de datos relacionada (relationship: Survey2Data).
+    Dado un ítem (Survey o Feature Service), devuelve una URL válida de FeatureLayer.
+    - Si el item ya es Feature Service → su URL.
+    - Si es Survey123 → relación Survey2Data (capa de respuestas).
     """
     portal = clean_url(portal_base)
     item_url = f"{portal}/sharing/rest/content/items/{item_id}"
     meta = get_json(item_url, token=token)
 
-    # Caso 1: Item tipo "Feature Service"
-    if meta.get("type", "").lower() in ["feature service", "feature layer"]:
-        svc_url = meta.get("url", "")
+    # 1) Feature Service directo
+    t = (meta.get("type") or "").lower()
+    svc_url = meta.get("url", "") or ""
+
+    if t in ["feature service", "feature layer"]:
         if is_feature_layer_url(svc_url):
-            return svc_url
-        # Si es un FeatureServer sin /0, agregamos /0 por defecto
+            return svc_url if "/FeatureServer/" in svc_url else f"{svc_url}/0"
         if svc_url.endswith("/FeatureServer"):
-            return svc_url + "/0"
+            return f"{svc_url}/0"
 
-    # Caso 2: Survey -> buscar relación Survey2Data
-    rel_url = f"{item_url}/relatedItems"
-    rel = get_json(rel_url, token=token, params={
-        "relationshipType": "Survey2Data",
-        "direction": "forward"
-    })
-    related = rel.get("relatedItems", [])
-    if related:
-        data_item = related[0]
-        svc_url = data_item.get("url", "")
-        if svc_url:
-            if is_feature_layer_url(svc_url):
-                return svc_url
-            if svc_url.endswith("/FeatureServer"):
-                return svc_url + "/0"
+    # 2) Survey → relación Survey2Data
+    rel = get_json(f"{item_url}/relatedItems",
+                   token=token,
+                   params={"relationshipType": "Survey2Data", "direction": "forward"})
+    for it in rel.get("relatedItems", []):
+        rel_url = it.get("url", "")
+        if rel_url:
+            if is_feature_layer_url(rel_url):
+                return rel_url if "/FeatureServer/" in rel_url else f"{rel_url}/0"
+            if rel_url.endswith("/FeatureServer"):
+                return f"{rel_url}/0"
 
-    # Último intento: si el propio item tiene 'url' que parece FeatureServer
-    if "url" in meta:
-        svc_url = meta["url"]
+    # 3) Última oportunidad con 'url' del propio ítem
+    if svc_url:
         if is_feature_layer_url(svc_url):
-            return svc_url
+            return svc_url if "/FeatureServer/" in svc_url else f"{svc_url}/0"
         if svc_url.endswith("/FeatureServer"):
-            return svc_url + "/0"
+            return f"{svc_url}/0"
 
-    raise RuntimeError("No se pudo resolver la URL de FeatureLayer desde el item. "
+    raise RuntimeError("No se pudo resolver la URL de FeatureLayer desde el ítem. "
                        "Verifica permisos o comparte la URL del FeatureServer directamente.")
 
-def fetch_all_features(layer_url: str, token: str | None) -> tuple[pd.DataFrame, dict]:
-    """
-    Descarga todos los registros en páginas según maxRecordCount.
-    Devuelve DataFrame (atributos + lon/lat si es punto) y metadata de la capa.
-    """
+
+# =========================
+# Downloader de registros
+# =========================
+def fetch_all_features(layer_url: str, token: Optional[str]) -> Tuple[pd.DataFrame, dict]:
     layer_url = clean_url(layer_url)
+
+    # Metadatos de la capa
     meta = get_json(layer_url, token=token)
     max_count = meta.get("maxRecordCount", 2000)
     geom_type = meta.get("geometryType", "")
     fields = meta.get("fields", [])
-    objectid_field = next((f["name"] for f in fields if f.get("type") == "esriFieldTypeOID"), "OBJECTID")
+    oid_field = next((f["name"] for f in fields if f.get("type") == "esriFieldTypeOID"), "OBJECTID")
 
-    # Primero contemos
-    count_json = post_json(layer_url + "/query", token=token, data={
+    # Conteo total
+    count = post_json(f"{layer_url}/query", token=token, data={
         "where": "1=1",
         "returnCountOnly": "true",
         "outFields": "*",
-        "returnGeometry": "true"
-    })
-    total = count_json.get("count", 0)
+        "returnGeometry": "false"
+    }).get("count", 0)
 
     rows = []
     fetched = 0
-    while fetched < total:
-        page = post_json(layer_url + "/query", token=token, data={
+    while fetched < count:
+        page = post_json(f"{layer_url}/query", token=token, data={
             "where": "1=1",
             "outFields": "*",
             "returnGeometry": "true",
             "resultOffset": fetched,
             "resultRecordCount": max_count,
-            "orderByFields": objectid_field,
+            "orderByFields": oid_field,
             "outSR": 4326
         })
         feats = page.get("features", [])
+        if not feats:
+            break
         for f in feats:
             attrs = f.get("attributes", {}) or {}
-            geom = f.get("geometry", None)
-            # Extraer lon/lat si es punto
+            geom = f.get("geometry")
             if geom_type == "esriGeometryPoint" and geom:
                 attrs["_lon"] = geom.get("x")
                 attrs["_lat"] = geom.get("y")
             rows.append(attrs)
         fetched += len(feats)
-        if len(feats) == 0:
-            break
 
     df = pd.DataFrame(rows)
     return df, meta
 
-# ----------------- UI -----------------
-with st.expander("🔐 Acceso (solo si la capa es privada)"):
-    c1, c2 = st.columns([1, 1])
+
+# =========================
+# UI – Autenticación
+# =========================
+with st.expander("🔐 Acceso (marca solo si la capa es privada)", expanded=False):
+    c1, c2 = st.columns(2)
     with c1:
         portal_base = st.text_input(
-            "Portal de ArcGIS (ej. https://sembremos-seg.maps.arcgis.com)",
-            value="https://sembremos-seg.maps.arcgis.com"
+            "Portal de ArcGIS (Online o Enterprise)",
+            value="https://sembremos-seg.maps.arcgis.com",
+            help="Para ArcGIS Online se usará https://www.arcgis.com para generar el token automáticamente."
         )
-        modo_privado = st.checkbox("La capa es privada (requiere iniciar sesión)", value=False)
+        privado = st.checkbox("La capa es privada (requiere iniciar sesión)", value=False)
     with c2:
-        user = st.text_input("Usuario", value="", disabled=not modo_privado, placeholder="tu_usuario")
-        pwd = st.text_input("Contraseña", value="", disabled=not modo_privado, type="password")
+        user = st.text_input("Usuario", value="", disabled=not privado, placeholder="tu_usuario")
+        pwd = st.text_input("Contraseña", value="", disabled=not privado, type="password")
 
-with st.expander("🧩 Origen de datos"):
-    origen = st.radio("¿Qué vas a pegar?", ["URL de FeatureLayer", "URL/ID de Ítem (Survey123 o Feature Service)"], horizontal=True)
-    if origen == "URL de FeatureLayer":
-        feature_url = st.text_input(
-            "Pega la URL del FeatureLayer (ej. .../FeatureServer/0)",
-            value=""
-        )
-        item_input = ""
+# =========================
+# UI – Origen
+# =========================
+with st.expander("🧩 Origen de datos", expanded=True):
+    origen = st.radio("¿Qué vas a pegar?",
+                      ["URL de Feature Layer (/FeatureServer/0)",
+                       "URL/ID de Ítem (Survey123 o Feature Service)",
+                       "Enlace corto arcg.is/xxxxx"],
+                      horizontal=False)
+
+    feature_url = ""
+    item_input = ""
+
+    if origen == "URL de Feature Layer (/FeatureServer/0)":
+        feature_url = st.text_input("Pega la URL del FeatureLayer", value="")
+    elif origen == "URL/ID de Ítem (Survey123 o Feature Service)":
+        item_input = st.text_input("Pega la URL del ítem (home/item.html?id=...) o el ID de 32 caracteres", value="")
     else:
-        item_input = st.text_input(
-            "Pega la URL del ítem (home/item.html?id=...) o el ID de 32 caracteres",
-            value=""
-        )
-        feature_url = ""
-
-    st.caption("Tip: si tienes un enlace corto arcg.is/xxxxx, abrelo en el navegador y copia el enlace largo del ítem.")
+        item_input = st.text_input("Pega el enlace corto arcg.is/xxxxx", value="")
 
 ok = st.button("Cargar datos", type="primary")
 
-# ----------------- Lógica -----------------
+# =========================
+# Lógica principal
+# =========================
 if ok:
     try:
+        # 1) Token si es privado
         token = None
-        if modo_privado:
+        if privado:
             if not (portal_base and user and pwd):
                 st.error("Para capas privadas, completa portal, usuario y contraseña.")
                 st.stop()
             with st.spinner("Generando token..."):
-                token = gen_token(portal_base, user, pwd)
+                token = generate_token(portal_base, user, pwd, referer=portal_base)
 
-        # Resolver URL del FeatureLayer si vino un ítem
-        if origen == "URL/ID de Ítem (Survey123 o Feature Service)":
-            item_id = extract_item_id(item_input)
-            if not item_id:
-                st.error("No pude identificar el ID del ítem. Pega el enlace largo (home/item.html?id=...) o el ID de 32 caracteres.")
-                st.stop()
-            with st.spinner("Resolviendo URL de capa de datos..."):
-                layer_url = resolve_featurelayer_from_item(portal_base, item_id, token)
-        else:
+        # 2) Resolver URL del FeatureLayer según origen
+        if origen == "URL de Feature Layer (/FeatureServer/0)":
             if not feature_url:
-                st.error("Pega la URL del FeatureLayer.")
+                st.error("Pega la URL del FeatureLayer (debe terminar en /FeatureServer/0).")
                 st.stop()
-            layer_url = feature_url
+            layer_url = clean_url(feature_url)
+
+        else:
+            item_id = extract_item_id_any(item_input)
+            if not item_id:
+                st.error("No pude identificar el ID del ítem. "
+                         "Si pegaste arcg.is, asegúrate de que redirige a un item. "
+                         "Sino, pega el enlace largo (home/item.html?id=...) o el ID de 32 caracteres.")
+                st.stop()
+            with st.spinner("Resolviendo URL de capa de datos (FeatureLayer)..."):
+                layer_url = resolve_featurelayer_from_item(portal_base, item_id, token)
 
         st.info(f"Usando capa: `{layer_url}`")
 
+        # 3) Descargar registros
         with st.spinner("Descargando registros..."):
             df, meta = fetch_all_features(layer_url, token)
 
         if df.empty:
-            st.warning("La capa no tiene registros (o no tienes permisos para verlos).")
+            st.warning("La capa no tiene registros o no tienes permisos para verlos.")
             st.stop()
 
-        # Mostrar algunos metadatos útiles
+        # 4) Metadatos + Tabla
         left, right = st.columns([2, 1])
         with right:
             st.subheader("ℹ️ Metadatos")
@@ -265,44 +346,34 @@ if ok:
             st.subheader("📄 Tabla de respuestas")
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # Descargas
             c1, c2 = st.columns(2)
             with c1:
-                st.download_button(
-                    "⬇️ Descargar CSV",
-                    df.to_csv(index=False).encode("utf-8"),
-                    file_name="encuestas_arcgis.csv",
-                    mime="text/csv"
-                )
+                st.download_button("⬇️ Descargar CSV",
+                                   df.to_csv(index=False).encode("utf-8"),
+                                   file_name="encuestas_arcgis.csv",
+                                   mime="text/csv")
             with c2:
-                # Excel en memoria
-                from io import BytesIO
                 bio = BytesIO()
                 with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
                     df.to_excel(writer, index=False, sheet_name="datos")
-                st.download_button(
-                    "⬇️ Descargar Excel",
-                    bio.getvalue(),
-                    file_name="encuestas_arcgis.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                st.download_button("⬇️ Descargar Excel",
+                                   bio.getvalue(),
+                                   file_name="encuestas_arcgis.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # Mapa si hay puntos
-        if "_lat" in df.columns and "_lon" in df.columns:
+        # 5) Mapa (si hay puntos)
+        if {"_lat", "_lon"}.issubset(df.columns):
             st.subheader("🗺️ Mapa (puntos)")
-            # Centro aproximado
-            lat0 = df["_lat"].dropna().astype(float)
-            lon0 = df["_lon"].dropna().astype(float)
-            if not lat0.empty and not lon0.empty:
-                center = (lat0.mean(), lon0.mean())
+            lat = pd.to_numeric(df["_lat"], errors="coerce").dropna()
+            lon = pd.to_numeric(df["_lon"], errors="coerce").dropna()
+            if not lat.empty and not lon.empty:
+                center = (lat.mean(), lon.mean())
                 m = folium.Map(location=center, zoom_start=11, control_scale=True)
-                # Marcadores
                 for _, r in df.iterrows():
                     if pd.notna(r.get("_lat")) and pd.notna(r.get("_lon")):
                         folium.CircleMarker(
                             location=(float(r["_lat"]), float(r["_lon"])),
-                            radius=4,
-                            fill=True
+                            radius=4, fill=True
                         ).add_to(m)
                 st_folium(m, height=480, use_container_width=True)
         else:
@@ -310,7 +381,4 @@ if ok:
 
     except Exception as e:
         st.error(f"Error: {e}")
-        st.toast("Revisa si la capa es pública o si el usuario/contraseña/portal son correctos.", icon="⚠️")
-
-
-
+        st.toast("Verifica: (1) URL del FeatureLayer o Ítem, (2) permisos, (3) si la capa es privada, usa usuario/contraseña correctos.", icon="⚠️")

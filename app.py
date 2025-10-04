@@ -48,6 +48,9 @@ def gen_token(portal_base: str, username: str, password: str) -> str:
     Genera token con generateToken (referer). Soporta ArcGIS Online/Enterprise.
     """
     portal = clean_url(portal_base)
+    if "arcgis.com" in portal:
+    url = "https://www.arcgis.com/sharing/rest/generateToken"
+else:
     url = f"{portal}/sharing/rest/generateToken"
     data = {
         "username": username,
@@ -308,5 +311,6 @@ if ok:
     except Exception as e:
         st.error(f"Error: {e}")
         st.toast("Revisa si la capa es pública o si el usuario/contraseña/portal son correctos.", icon="⚠️")
+
 
 

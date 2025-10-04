@@ -88,7 +88,7 @@ def center_from_points(df, lon_col, lat_col):
     if np.isnan(mlat) or np.isnan(mlon): return (10.0, -84.0)
     return (float(mlat), float(mlon))
 
-def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx"):
+def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", key: str = "dl_default"):
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="datos")
@@ -97,7 +97,8 @@ def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx"):
         label="⬇️ Descargar Excel limpio",
         data=bio,
         file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=key,  # clave única por botón
     )
 
 # ======== Sidebar mínimo (solo carga) ========
@@ -168,7 +169,7 @@ else:
 
     # Panel de limpieza
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
-        # -------- CORRECCIÓN: construir 'dupes_show' y usarlo para armar 'opciones' --------
+        # Tabla con rango de fechas
         dupes_show = dupes[["conteo_duplicados","primero","ultimo","ventana_min","indices"]].copy()
 
         def fmt_dt(x):
@@ -180,12 +181,11 @@ else:
         dupes_show["rango"] = dupes_show["primero"].apply(fmt_dt) + " → " + dupes_show["ultimo"].apply(fmt_dt)
         st.dataframe(dupes_show.drop(columns=["primero","ultimo"]), use_container_width=True)
 
-        # Usamos dupes_show (que sí tiene 'rango') para las opciones
+        # Opciones para seleccionar grupos (usamos dupes_show que sí tiene 'rango')
         opciones = [
             f"Grupo {i+1} – {row['conteo_duplicados']} elementos – {row['rango']}"
             for i, row in dupes_show.reset_index(drop=True).iterrows()
         ]
-
         seleccion = st.multiselect("Selecciona grupos a limpiar (o deja vacío para todos):", opciones)
 
         criterio = st.radio("Criterio de conservación (¿cuál se queda en cada grupo?)",
@@ -193,8 +193,7 @@ else:
 
         def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list, opciones_txt: list):
             df_out = df_in.copy()
-            # por defecto todos
-            selected_rows = list(range(len(dupes_df)))
+            selected_rows = list(range(len(dupes_df)))  # por defecto todos
             if seleccion_opciones:
                 selected_rows = [opciones_txt.index(s) for s in seleccion_opciones]
 
@@ -202,7 +201,6 @@ else:
                 idxs = dupes_df.iloc[pos]["indices"]
                 sub = df_out.loc[idxs]
                 if time_col in df_out.columns:
-                    # argsort con mergesort (estable) por NaT al principio; luego tomamos extremo
                     orden = sub[time_col].argsort(kind="mergesort")
                     keep = sub.index[orden[-1]] if criterio.startswith("Mantener el más reciente") else sub.index[orden[0]]
                 else:
@@ -218,7 +216,7 @@ else:
                 st.success("Limpieza realizada. Actualizando tabla y mapa…")
                 st.rerun()
         with colb2:
-            to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx")
+            to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx", key="dl_limpio_expander")
 
 # ======== Mapa ========
 st.markdown("### 🗺️ Mapa de respuestas")
@@ -281,7 +279,7 @@ if not valid_points.empty and len(valid_points) >= 2:
         for b in range(a + 1, len(pts)):
             lat1, lon1 = pts[a]; lat2, lon2 = pts[b]
             d = haversine_m(lat1, lon1, lat2, lon2)
-            if d <= 200:
+            if d <= distance_threshold_m:
                 pairs.append((idx[a], idx[b], float(d), lat1, lon1, lat2, lon2))
 if pairs:
     for _, _, d, la, lo, lb, lob in sorted(pairs, key=lambda x: x[2]):
@@ -318,7 +316,7 @@ st_folium(m, use_container_width=True, returned_objects=[])
 
 # ======== Descarga & Tabla ========
 st.markdown("### ⬇️ Exportar datos limpios")
-to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx")
+to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx", key="dl_limpio_footer")
 
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)

@@ -39,9 +39,11 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return R * c
 
 def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list):
+    """Devuelve DataFrame con grupos de duplicados exactos (mismo contenido) en ventana corta."""
     if df.empty or not content_cols: return pd.DataFrame()
     tmp = df.copy()
 
+    # normalización de columnas de contenido
     normalized = {}
     for c in content_cols:
         if "factor" in c.lower():
@@ -53,6 +55,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
     key = pd.util.hash_pandas_object(norm_df, index=False)
     tmp["_hash_content"] = key
     tmp[time_col] = pd.to_datetime(tmp[time_col], errors="coerce")
+    tmp["_row_i"] = tmp.index  # conservar índice original
     tmp = tmp.sort_values(time_col).reset_index(drop=True)
 
     win = pd.Timedelta(minutes=window_minutes)
@@ -70,8 +73,9 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
                     "ultimo": gb[time_col].max(),
                     "ventana_min": window_minutes,
                     "hash": h,
-                    "indices": gb.index.tolist()
+                    "indices": gb["_row_i"].tolist()  # índices del df original
                 }
+                # Columna de contenido de referencia (opcional para vista)
                 for c in content_cols:
                     row[c] = norm_df.loc[gb.index[0], c]
                 results.append(row)
@@ -84,6 +88,18 @@ def center_from_points(df, lon_col, lat_col):
     mlat = df[lat_col].mean(skipna=True); mlon = df[lon_col].mean(skipna=True)
     if np.isnan(mlat) or np.isnan(mlon): return (10.0, -84.0)
     return (float(mlat), float(mlon))
+
+def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx"):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="datos")
+    bio.seek(0)
+    st.download_button(
+        label="⬇️ Descargar Excel limpio",
+        data=bio,
+        file_name=filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # ======== Sidebar mínimo (solo carga) ========
 st.sidebar.header("Cargar Excel")
@@ -105,14 +121,19 @@ if not uploaded:
     st.info("Sube un Excel (.xlsx) en la barra lateral para comenzar.")
     st.stop()
 
-df, sheet_name = load_excel_first_sheet(uploaded)
+df_raw, sheet_name = load_excel_first_sheet(uploaded)
+
+# mantener df limpio en sesión para permitir eliminaciones
+if "df_clean" not in st.session_state:
+    st.session_state.df_clean = df_raw.copy()
+df = st.session_state.df_clean  # trabajamos sobre el limpio
 
 # coerción de fechas si están
 for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
     if c in df.columns:
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
-# ======== Parámetros fijos (sin mostrar en UI) ========
+# ======== Parámetros fijos ========
 lon_col, lat_col = "x", "y"
 time_col = "CreationDate" if "CreationDate" in df.columns else (
     "EditDate" if "EditDate" in df.columns else "¿Cuándo fue el último incidente?"
@@ -132,17 +153,65 @@ if "¿Cómo califica la seguridad en su zona?" in df.columns:
     top_seg = seg_counts.index[0] if not seg_counts.empty else "-"
     with c4: st.metric("Calificación más frecuente", top_seg)
 
-# ======== Duplicados exactos (ventana corta) ========
+# ======== Duplicados exactos (ventana 10 min) ========
 st.markdown("### 🧪 Duplicados exactos en ≤ 10 min")
 content_cols = [c for c in df.columns if c not in META_COLS | {lon_col, lat_col}]
 dupes = detect_duplicates(df, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
+
+dup_set = set()
 if dupes.empty:
     st.success("No se detectaron grupos de respuestas EXACTAMENTE iguales en la ventana indicada.")
 else:
     st.warning(f"Se detectaron {dupes.shape[0]} grupo(s) de posibles duplicados exactos.")
-    with st.expander("Ver detalle de duplicados"):
-        show_cols = ["conteo_duplicados", "primero", "ultimo", "ventana_min"] + content_cols + ["indices"]
-        st.dataframe(dupes[show_cols], use_container_width=True)
+    # construir set de índices duplicados
+    for lst in dupes["indices"]:
+        dup_set.update(lst)
+
+    # Panel de limpieza
+    with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
+        # listado amigable de grupos
+        dupes_show = dupes[["conteo_duplicados","primero","ultimo","ventana_min","indices"]].copy()
+        dupes_show["rango"] = dupes_show["primero"].dt.strftime("%Y-%m-%d %H:%M").fillna("-") + " → " + \
+                              dupes_show["ultimo"].dt.strftime("%Y-%m-%d %H:%M").fillna("-")
+        dupes_show = dupes_show.drop(columns=["primero","ultimo"])
+        st.dataframe(dupes_show, use_container_width=True)
+
+        opciones = [f"Grupo {i+1} – {row['conteo_duplicados']} elementos – {row['rango']}"
+                    for i, (_, row) in enumerate(dupes.iterrows())]
+        seleccion = st.multiselect("Selecciona grupos a limpiar (o deja vacío para todos):", opciones)
+
+        criterio = st.radio("Criterio de conservación (¿cuál se queda en cada grupo?)",
+                            ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
+
+        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list):
+            df_out = df_in.copy()
+            # map de opción a índices
+            selected_rows = list(range(len(dupes_df)))  # por defecto todos
+            if seleccion_opciones:
+                selected_rows = [opciones.index(s) for s in seleccion_opciones]
+
+            for pos in selected_rows:
+                idxs = dupes_df.iloc[pos]["indices"]
+                # decidir cuál conservar
+                sub = df_out.loc[idxs]
+                if time_col in df_out.columns:
+                    orden = sub[time_col].argsort(kind="mergesort")
+                    keep = sub.index[orden[-1]] if criterio.startswith("Mantener el más reciente") else sub.index[orden[0]]
+                else:
+                    keep = idxs[0]  # fallback
+                # eliminar todos menos keep
+                drop_ids = [i for i in idxs if i != keep]
+                df_out = df_out.drop(index=drop_ids, errors="ignore")
+            return df_out
+
+        colb1, colb2 = st.columns([1,1])
+        with colb1:
+            if st.button("🧹 Limpiar seleccionados / todos"):
+                st.session_state.df_clean = limpiar(st.session_state.df_clean, dupes, seleccion)
+                st.success("Limpieza realizada. Actualizando tabla y mapa…")
+                st.rerun()
+        with colb2:
+            to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx")
 
 # ======== Mapa ========
 st.markdown("### 🗺️ Mapa de respuestas")
@@ -164,11 +233,11 @@ folium.TileLayer(tiles="https://{s}.tile.stamen.com/terrain/{z}/{x}/{y}.png",
 folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                  attr="Tiles © Esri", name="Esri WorldImagery (satelital)").add_to(m)
 
-# marcadores + clúster
+# marcadores: duplicados en rojo, resto azul
 if not valid_points.empty:
     mc = MarkerCluster(name="Clúster de puntos")
     mc.add_to(m)
-    for _, r in valid_points.iterrows():
+    for idx, r in valid_points.iterrows():
         lat, lon = float(r[lat_col]), float(r[lon_col])
         popup_fields = []
         for c in df.columns:
@@ -178,7 +247,9 @@ if not valid_points.empty:
                 try: val = pd.to_datetime(val).strftime("%Y-%m-%d %H:%M")
                 except: pass
             popup_fields.append(f"<b>{c}:</b> {val}")
-        folium.Marker([lat, lon], popup=folium.Popup("<br>".join(popup_fields), max_width=400)).add_to(mc)
+        is_dup = idx in dup_set
+        icon = folium.Icon(color="red" if is_dup else "blue", icon="info-sign")
+        folium.Marker([lat, lon], popup=folium.Popup("<br>".join(popup_fields), max_width=420), icon=icon).add_to(mc)
 
 # heatmap rojo
 if not valid_points.empty and len(valid_points) >= 2:
@@ -215,7 +286,6 @@ MeasureControl(position='topright',
                primary_area_unit='sqmeters',
                secondary_area_unit='hectares').add_to(m)
 
-# inyectar JS para traducir textos del popup del control de medida
 from folium import Element
 script = """
 function traducirPopupMedida(){
@@ -235,6 +305,9 @@ m.get_root().html.add_child(Element(f"<script>{script}</script>"))
 # render
 st_folium(m, use_container_width=True, returned_objects=[])
 
-# tabla final
+# ======== Descarga & Tabla ========
+st.markdown("### ⬇️ Exportar datos limpios")
+to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx")
+
 st.markdown("### 📄 Datos (primeras filas)")
-st.dataframe(df.head(1000), use_container_width=True)
+st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)

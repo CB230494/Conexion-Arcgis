@@ -1,319 +1,384 @@
 # -*- coding: utf-8 -*-
-# app.py — Lector de encuestas ArcGIS / Survey123 (solo lectura) con autodetección de 403
+import io
+from datetime import datetime, timedelta
 
-import re
-from io import BytesIO
-from typing import Optional, Tuple
-from urllib.parse import urlparse, parse_qs
-
-import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
+
 import folium
+from folium.plugins import MarkerCluster, HeatMap, MeasureControl
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Lectura de encuestas ArcGIS (Solo lectura)", layout="wide")
-st.title("📥 Lectura de encuestas ArcGIS / Survey123 (solo lectura)")
-st.caption("Solo lectura. Soporta ArcGIS Online y Enterprise, items de Survey123 y Feature Services.")
+# ===================== CONFIG =====================
+st.set_page_config(page_title="Dashboard de Encuestas – Seguridad", layout="wide")
 
-# --------------------------- Helpers HTTP/JSON ---------------------------
-def _http_get(url: str, params: dict | None = None, timeout: int = 60) -> requests.Response:
-    r = requests.get(url, params=params, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r
+st.title("📊 Dashboard de Encuestas – Seguridad")
+st.caption("Conteos, detección de duplicados en ventana corta, y mapa con clúster/heatmap/distancias.")
 
-def _http_post(url: str, data: dict | None = None, timeout: int = 60) -> requests.Response:
-    r = requests.post(url, data=data, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r
+# ===================== UTILIDADES =====================
 
-def _json_or_raise_text(resp: requests.Response) -> dict:
-    ctype = resp.headers.get("Content-Type", "")
-    txt = resp.text.strip()
+META_COLS = {"ObjectID", "GlobalID", "instance_id", "CreationDate", "EditDate", "Creator", "Editor"}
+
+def parse_datetime_safe(x):
+    """Convierte a datetime si es posible; devuelve NaT si no."""
     try:
-        if "application/json" in ctype or txt.startswith("{") or txt.startswith("["):
-            j = resp.json()
-        else:
-            raise ValueError("Respuesta no es JSON")
+        return pd.to_datetime(x)
     except Exception:
-        preview = txt[:300].replace("\n", " ")
-        raise RuntimeError(f"La URL no devolvió JSON (posible falta de permisos/login o URL no-REST). "
-                           f"Respuesta inicial: {preview}")
-    if isinstance(j, dict) and "error" in j:
-        # Errores REST de ArcGIS vienen bajo 'error'
-        err = j["error"]
-        code = err.get("code")
-        message = err.get("message") or err.get("messageCode") or "Error REST"
-        details = err.get("details") or []
-        raise RuntimeError(f"{code or ''} {message}. details={details}")
-    return j
+        return pd.NaT
 
-def _is_403_message(msg: str) -> bool:
-    return "403" in msg or "GWM_0003" in msg or "do not have permissions" in msg.lower()
+def normalize_string(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s).strip().lower()
+    # normalizar separadores múltiples y espacios
+    s = " ".join(s.split())
+    return s
 
-# --------------------------- Detectores y parsing ---------------------------
-FEATURE_RE = re.compile(r"/FeatureServer(?:/\d+)?/?$", re.IGNORECASE)
+def normalize_factors(s: str) -> str:
+    """Normaliza '¿Cuáles factores influyen?' separando por coma y ordenando para evitar desajustes por orden."""
+    if pd.isna(s):
+        return ""
+    parts = [normalize_string(p) for p in str(s).replace(";", ",").split(",")]
+    parts = [p for p in parts if p]
+    parts.sort()
+    return ",".join(parts)
 
-def is_featurelayer_url(url: str) -> bool:
-    return bool(FEATURE_RE.search(url.strip()))
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Distancia Haversine en metros."""
+    R = 6371000.0
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2.0)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2.0)**2
+    c = 2*np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
 
-def clean_url(u: str) -> str:
-    return u.strip().rstrip("/")
+def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list):
+    """
+    Detecta grupos de filas con contenido exactamente igual (en content_cols),
+    cuya diferencia de tiempo entre valores consecutivos sea <= ventana especificada.
+    Devuelve un DataFrame con grupo, tamaño del grupo y rango temporal.
+    """
+    if df.empty or not content_cols:
+        return pd.DataFrame()
 
-def expand_arcgis_short(short_url: str) -> str:
-    r = _http_get(short_url)
-    return r.url  # URL final (item.html?id=...)
+    tmp = df.copy()
 
-def extract_item_id_from_url(url: str) -> Optional[str]:
-    q = parse_qs(urlparse(url).query)
-    return q.get("id", [None])[0]
-
-def extract_item_id_any(s: str) -> Optional[str]:
-    s = s.strip()
-    if len(s) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", s):
-        return s
-    if "arcg.is/" in s:
-        expanded = expand_arcgis_short(s)
-        return extract_item_id_from_url(expanded)
-    if "item.html" in s:
-        return extract_item_id_from_url(s)
-    return None
-
-# --------------------------- Token / autenticación ---------------------------
-def guess_generate_token_endpoint(portal_base: str) -> str:
-    portal = clean_url(portal_base)
-    netloc = urlparse(portal).netloc
-    if "arcgis.com" in netloc:  # ArcGIS Online
-        return "https://www.arcgis.com/sharing/rest/generateToken"
-    return f"{portal}/sharing/rest/generateToken"
-
-def generate_token(portal_base: str, username: str, password: str, referer: Optional[str] = None) -> str:
-    ep = guess_generate_token_endpoint(portal_base)
-    data = {
-        "username": username,
-        "password": password,
-        "client": "referer",
-        "referer": referer or portal_base,
-        "f": "json",
-        "expiration": 60
-    }
-    r = _http_post(ep, data=data, timeout=30)
-    j = _json_or_raise_text(r)
-    token = j.get("token")
-    if not token:
-        raise RuntimeError("No se obtuvo 'token' en la respuesta al generar token.")
-    return token
-
-# --------------------------- REST helpers ---------------------------
-def get_json(url: str, token: Optional[str] = None, params: dict | None = None) -> dict:
-    p = {"f": "json"}
-    if params: p.update(params)
-    if token:  p["token"] = token
-    r = _http_get(url, params=p)
-    return _json_or_raise_text(r)
-
-def post_json(url: str, token: Optional[str] = None, data: dict | None = None) -> dict:
-    d = {"f": "json"}
-    if data:  d.update(data)
-    if token: d["token"] = token
-    r = _http_post(url, data=d)
-    return _json_or_raise_text(r)
-
-# --------------------------- Resolver capa desde Item ---------------------------
-def resolve_featurelayer_from_item(portal_base: str, item_id: str, token: Optional[str]) -> str:
-    portal = clean_url(portal_base)
-    item_url = f"{portal}/sharing/rest/content/items/{item_id}"
-
-    meta = get_json(item_url, token=token)
-    t = (meta.get("type") or "").lower()
-    svc_url = meta.get("url", "") or ""
-
-    # Caso 1: Item ya es un Feature Service/Layer
-    if t in ["feature service", "feature layer", "feature service item"]:
-        if is_featurelayer_url(svc_url):
-            return svc_url if "/FeatureServer/" in svc_url else f"{svc_url}/0"
-        if svc_url.endswith("/FeatureServer"):
-            return f"{svc_url}/0"
-
-    # Caso 2: Survey123 → relación Survey2Data (datos)
-    rel = get_json(f"{item_url}/relatedItems",
-                   token=token,
-                   params={"relationshipType": "Survey2Data", "direction": "forward"})
-    for it in rel.get("relatedItems", []):
-        rel_url = it.get("url", "")
-        if rel_url:
-            if is_featurelayer_url(rel_url):
-                return rel_url if "/FeatureServer/" in rel_url else f"{rel_url}/0"
-            if rel_url.endswith("/FeatureServer"):
-                return f"{rel_url}/0"
-
-    # Caso 3: último intento con la 'url' del propio ítem
-    if svc_url:
-        if is_featurelayer_url(svc_url):
-            return svc_url if "/FeatureServer/" in svc_url else f"{svc_url}/0"
-        if svc_url.endswith("/FeatureServer"):
-            return f"{svc_url}/0"
-
-    raise RuntimeError("No se pudo resolver la URL de FeatureLayer desde el ítem (revisa permisos).")
-
-# --------------------------- Descarga de features ---------------------------
-def fetch_all_features(layer_url: str, token: Optional[str]) -> Tuple[pd.DataFrame, dict]:
-    layer_url = clean_url(layer_url)
-    meta = get_json(layer_url, token=token)
-    max_count = meta.get("maxRecordCount", 2000)
-    geom_type = meta.get("geometryType", "")
-    fields = meta.get("fields", [])
-    oid_field = next((f["name"] for f in fields if f.get("type") == "esriFieldTypeOID"), "OBJECTID")
-
-    cnt = post_json(f"{layer_url}/query", token=token, data={
-        "where": "1=1", "returnCountOnly": "true", "outFields": "*", "returnGeometry": "false"
-    }).get("count", 0)
-
-    rows, fetched = [], 0
-    while fetched < cnt:
-        page = post_json(f"{layer_url}/query", token=token, data={
-            "where": "1=1",
-            "outFields": "*",
-            "returnGeometry": "true",
-            "resultOffset": fetched,
-            "resultRecordCount": max_count,
-            "orderByFields": oid_field,
-            "outSR": 4326
-        })
-        feats = page.get("features", [])
-        if not feats:
-            break
-        for f in feats:
-            attrs = f.get("attributes", {}) or {}
-            geom = f.get("geometry")
-            if geom_type == "esriGeometryPoint" and geom:
-                attrs["_lon"] = geom.get("x")
-                attrs["_lat"] = geom.get("y")
-            rows.append(attrs)
-        fetched += len(feats)
-
-    return pd.DataFrame(rows), meta
-
-# --------------------------- UI: Autenticación ---------------------------
-with st.expander("🔐 Acceso (marca si la capa/ítem es privado)", expanded=False):
-    c1, c2 = st.columns(2)
-    with c1:
-        portal_base = st.text_input(
-            "Portal (Online o Enterprise)",
-            value="https://sembremos-seg.maps.arcgis.com",
-            help="Si es *.arcgis.com, el token se genera en https://www.arcgis.com automáticamente."
-        )
-        privado = st.checkbox("La capa/ítem es privado (requiere login)", value=False)
-    with c2:
-        user = st.text_input("Usuario", value="", disabled=not privado)
-        pwd = st.text_input("Contraseña", value="", disabled=not privado, type="password")
-
-# --------------------------- UI: Origen ---------------------------
-with st.expander("🧩 Origen de datos", expanded=True):
-    origen = st.radio(
-        "¿Qué vas a pegar?",
-        ["URL de Feature Layer (/FeatureServer/0)",
-         "URL/ID de Ítem (Survey123 o Feature Service)",
-         "Enlace corto arcg.is/xxxxx"],
-        horizontal=False
-    )
-    feature_url, item_input = "", ""
-    if origen == "URL de Feature Layer (/FeatureServer/0)":
-        feature_url = st.text_input("Pega la URL del FeatureLayer", value="")
-    elif origen == "URL/ID de Ítem (Survey123 o Feature Service)":
-        item_input = st.text_input("Pega la URL del ítem (home/item.html?id=...) o el ID", value="")
-    else:
-        item_input = st.text_input("Pega el enlace corto arcg.is/xxxxx", value="")
-
-ok = st.button("Cargar datos", type="primary")
-
-# --------------------------- Lógica principal ---------------------------
-def cargar(token: Optional[str]) -> None:
-    # Resolver URL de capa
-    if origen == "URL de Feature Layer (/FeatureServer/0)":
-        if not feature_url:
-            st.error("Pega la URL del FeatureLayer (debe terminar en /FeatureServer/0).")
-            st.stop()
-        layer_url = clean_url(feature_url)
-    else:
-        item_id = extract_item_id_any(item_input)
-        if not item_id:
-            st.error("No pude identificar el ID del ítem. Si pegaste arcg.is, verifica que apunte a un item.")
-            st.stop()
-        with st.spinner("Resolviendo URL de FeatureLayer..."):
-            layer_url = resolve_featurelayer_from_item(portal_base, item_id, token)
-
-    st.info(f"Usando capa: `{layer_url}`")
-
-    # Descargar registros
-    with st.spinner("Descargando registros..."):
-        df, meta = fetch_all_features(layer_url, token)
-
-    if df.empty:
-        st.warning("La capa no tiene registros o no tienes permisos para verlos.")
-        st.stop()
-
-    left, right = st.columns([2, 1])
-    with right:
-        st.subheader("ℹ️ Metadatos")
-        st.write({
-            "name": meta.get("name"),
-            "geometryType": meta.get("geometryType"),
-            "maxRecordCount": meta.get("maxRecordCount"),
-            "fields": len(meta.get("fields", []))
-        })
-
-    with left:
-        st.subheader("📄 Tabla de respuestas")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("⬇️ CSV", df.to_csv(index=False).encode("utf-8"),
-                               file_name="encuestas_arcgis.csv", mime="text/csv")
-        with c2:
-            bio = BytesIO()
-            with pd.ExcelWriter(bio, engine="xlsxwriter") as w:
-                df.to_excel(w, index=False, sheet_name="datos")
-            st.download_button("⬇️ Excel", bio.getvalue(),
-                               file_name="encuestas_arcgis.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    # Mapa si son puntos
-    if {"_lat", "_lon"}.issubset(df.columns):
-        st.subheader("🗺️ Mapa (puntos)")
-        lat = pd.to_numeric(df["_lat"], errors="coerce").dropna()
-        lon = pd.to_numeric(df["_lon"], errors="coerce").dropna()
-        if not lat.empty and not lon.empty:
-            m = folium.Map(location=(lat.mean(), lon.mean()), zoom_start=11, control_scale=True)
-            for _, r in df.iterrows():
-                if pd.notna(r.get("_lat")) and pd.notna(r.get("_lon")):
-                    folium.CircleMarker(location=(float(r["_lat"]), float(r["_lon"])),
-                                        radius=4, fill=True).add_to(m)
-            st_folium(m, height=480, use_container_width=True)
-    else:
-        st.info("La capa no es de puntos o no trae geometría; se muestra solo la tabla.")
-
-if ok:
-    try:
-        token = None
-        # Intento 1: si marcaste privado, genero token primero
-        if privado:
-            if not (portal_base and user and pwd):
-                st.error("Para privado: completa portal, usuario y contraseña.")
-                st.stop()
-            with st.spinner("Generando token..."):
-                token = generate_token(portal_base, user, pwd, referer=portal_base)
-            cargar(token)
+    # normalizar columnas de contenido
+    normalized = {}
+    for c in content_cols:
+        if "factor" in c.lower():
+            normalized[c] = tmp[c].apply(normalize_factors)
         else:
-            # Intento 2: probar sin token; si da 403, te pido login automáticamente
-            try:
-                cargar(token=None)
-            except Exception as e:
-                msg = str(e)
-                if _is_403_message(msg):
-                    st.warning("🔒 El recurso parece privado. Activa 'La capa/ítem es privado' y coloca usuario/contraseña.")
-                raise
-    except Exception as e:
-        st.error(f"Error: {e}")
-        st.toast("Verifica: (1) URL del FeatureLayer o Ítem, (2) permisos, (3) si es privado, inicia sesión.", icon="⚠️")
+            normalized[c] = tmp[c].apply(normalize_string)
+    norm_df = pd.DataFrame(normalized)
+
+    key = pd.util.hash_pandas_object(norm_df, index=False)  # hash estable por fila contenido
+    tmp["_hash_content"] = key
+
+    # asegurar datetime en time_col
+    tmp[time_col] = pd.to_datetime(tmp[time_col], errors="coerce")
+
+    # ordenar por tiempo para comparar ventanas
+    tmp = tmp.sort_values(time_col).reset_index(drop=True)
+
+    # por cada hash, detectar si hay eventos cercanos en el tiempo
+    results = []
+    win = pd.Timedelta(minutes=window_minutes)
+
+    for h, g in tmp.groupby("_hash_content", dropna=False):
+        g = g.copy().sort_values(time_col)
+        if g.shape[0] < 2:
+            continue
+
+        # Ventanas: marcamos pares cercanos y luego agrupamos consecutivos
+        g["time_diff_prev"] = g[time_col].diff()
+        # comenzamos un "bloque" cuando la diferencia es > ventana o NaT
+        block_id = (g["time_diff_prev"].isna() | (g["time_diff_prev"] > win)).cumsum()
+        for b, gb in g.groupby(block_id):
+            if gb.shape[0] >= 2:
+                row = {
+                    "conteo_duplicados": gb.shape[0],
+                    "primero": gb[time_col].min(),
+                    "ultimo": gb[time_col].max(),
+                    "ventana_min": window_minutes,
+                    "hash": h,
+                    "indices": gb.index.tolist()
+                }
+                # También agregamos una vista de las columnas de contenido para inspección
+                for c in content_cols:
+                    row[c] = norm_df.loc[gb.index[0], c]
+                results.append(row)
+
+    if not results:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(results).sort_values(["conteo_duplicados", "ultimo"], ascending=[False, False])
+    return out
+
+def ensure_lon_lat(df, lon_col="x", lat_col="y"):
+    """Valida que existan columnas de coordenadas y corrige tipos."""
+    if lon_col not in df.columns or lat_col not in df.columns:
+        st.warning("No se encontraron columnas de coordenadas 'x' (longitud) y 'y' (latitud). Ajusta en la barra lateral.")
+    # convertir a numéricos
+    for c in [lon_col, lat_col]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def center_from_points(df, lon_col, lat_col):
+    if df.empty or lon_col not in df.columns or lat_col not in df.columns:
+        return (10.0, -84.0)  # CR por defecto aproximado
+    mlat = df[lat_col].mean(skipna=True)
+    mlon = df[lon_col].mean(skipna=True)
+    if np.isnan(mlat) or np.isnan(mlon):
+        return (10.0, -84.0)
+    return (float(mlat), float(mlon))
+
+# ===================== SIDEBAR =====================
+
+st.sidebar.header("⚙️ Configuración")
+
+uploaded = st.sidebar.file_uploader("Sube un Excel (.xlsx)", type=["xlsx"])
+
+default_path = st.sidebar.text_input(
+    "O usa una ruta/archivo por defecto (opcional):",
+    value="/mnt/data/S123_709e5cc4d53d419083caa06f401bc335_EXCEL (1).xlsx"
+)
+
+sheet_name = st.sidebar.text_input("Nombre de la hoja", value="_1_de_formulario_0")
+
+lon_col = st.sidebar.text_input("Columna de Longitud (x)", value="x")
+lat_col = st.sidebar.text_input("Columna de Latitud (y)", value="y")
+
+date_col_candidates = ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]
+time_col = st.sidebar.selectbox("Columna de tiempo para ventanas cortas", options=date_col_candidates, index=0)
+
+window_minutes = st.sidebar.number_input("Ventana de tiempo (minutos) para detectar duplicados exactos", min_value=1, max_value=240, value=10)
+
+date_filter_enable = st.sidebar.checkbox("Filtrar por rango de fechas (según CreationDate)", value=True)
+today = pd.Timestamp.today().normalize()
+date_min = st.sidebar.date_input("Fecha inicial", value=today - pd.Timedelta(days=30))
+date_max = st.sidebar.date_input("Fecha final", value=pd.Timestamp.today())
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🗺️ Opciones de mapa")
+show_markers = st.sidebar.checkbox("Mostrar marcadores", value=True)
+use_cluster = st.sidebar.checkbox("Agrupar en clúster", value=True)
+show_heatmap = st.sidebar.checkbox("Mostrar Heatmap", value=True)
+heat_radius = st.sidebar.slider("Radio Heatmap (px)", min_value=5, max_value=50, value=20)
+heat_blur = st.sidebar.slider("Desenfoque Heatmap", min_value=5, max_value=50, value=25)
+
+base_map = st.sidebar.selectbox(
+    "Estilo de mapa base",
+    options=[
+        "CartoDB Positron (gris)",
+        "OpenStreetMap (callejero)",
+        "Stamen Toner (alto contraste)",
+        "Stamen Terrain (relieve)",
+        "Esri WorldImagery (satelital)",
+    ],
+    index=0
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📏 Distancias entre puntos")
+distance_enable = st.sidebar.checkbox("Calcular pares dentro de una distancia", value=False)
+distance_threshold_m = st.sidebar.number_input("Umbral de distancia (metros)", min_value=10, max_value=5000, value=200)
+
+# ===================== CARGA DE DATOS =====================
+
+@st.cache_data(show_spinner=False)
+def load_excel(file_like, sheet):
+    return pd.read_excel(file_like, sheet_name=sheet)
+
+def get_dataframe():
+    if uploaded is not None:
+        return load_excel(uploaded, sheet_name)
+    else:
+        # intentar con ruta por defecto
+        try:
+            return load_excel(default_path, sheet_name)
+        except Exception as e:
+            st.error(f"No se pudo abrir el Excel. Sube un archivo o verifica la ruta. Detalle: {e}")
+            return pd.DataFrame()
+
+df = get_dataframe()
+
+if df.empty:
+    st.stop()
+
+# Coercionar fechas
+for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+# Filtro por fechas (CreationDate)
+if date_filter_enable and "CreationDate" in df.columns:
+    mask = (df["CreationDate"].dt.date >= pd.to_datetime(date_min).date()) & \
+           (df["CreationDate"].dt.date <= pd.to_datetime(date_max).date())
+    df_filtered = df.loc[mask].copy()
+else:
+    df_filtered = df.copy()
+
+# Asegurar coords
+df_filtered = ensure_lon_lat(df_filtered, lon_col, lat_col)
+
+# ===================== MÉTRICAS =====================
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Total de respuestas (todas)", int(df.shape[0]))
+with col2:
+    st.metric("Respuestas en rango", int(df_filtered.shape[0]))
+
+if "CreationDate" in df_filtered.columns:
+    ult = df_filtered["CreationDate"].max()
+    with col3:
+        st.metric("Última respuesta (CreationDate)", "-" if pd.isna(ult) else ult.strftime("%Y-%m-%d %H:%M"))
+if "¿Cómo califica la seguridad en su zona?" in df_filtered.columns:
+    seg_counts = df_filtered["¿Cómo califica la seguridad en su zona?"].astype(str).str.lower().value_counts()
+    top_seg = seg_counts.index[0] if not seg_counts.empty else "-"
+    with col4:
+        st.metric("Calificación más frecuente", top_seg)
+
+st.markdown("### 🧪 Duplicados exactos en ventana corta")
+# columnas de contenido = todas menos meta y coords/tiempos evidentes
+content_cols = [c for c in df_filtered.columns if c not in META_COLS | {lon_col, lat_col}]
+dupes = detect_duplicates(df_filtered, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
+
+if dupes.empty:
+    st.success("No se detectaron grupos de respuestas EXACTAMENTE iguales dentro de la ventana de tiempo indicada.")
+else:
+    st.warning(f"Se detectaron {dupes.shape[0]} grupo(s) de posibles duplicados exactos en ≤ {window_minutes} min.")
+    # Expand para ver detalle
+    with st.expander("Ver detalle de duplicados"):
+        # Mostrar columnas clave y los índices involucrados
+        show_cols = ["conteo_duplicados", "primero", "ultimo", "ventana_min"] + content_cols + ["indices"]
+        st.dataframe(dupes[show_cols], use_container_width=True)
+
+# ===================== MAPA =====================
+
+st.markdown("### 🗺️ Mapa de respuestas")
+
+# Centro del mapa
+center_lat, center_lon = center_from_points(df_filtered, lon_col, lat_col)
+
+m = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
+
+# Capa base seleccionada
+base_tiles = {
+    "CartoDB Positron (gris)": ("CartoDB positron", "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                                "https://carto.com/attributions"),
+    "OpenStreetMap (callejero)": ("OpenStreetMap", None, None),
+    "Stamen Toner (alto contraste)": ("Stamen Toner", "https://{s}.tile.stamen.com/toner/{z}/{x}/{y}.png",
+                                      "Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap contributors"),
+    "Stamen Terrain (relieve)": ("Stamen Terrain", "https://{s}.tile.stamen.com/terrain/{z}/{x}/{y}.png",
+                                 "Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap contributors"),
+    "Esri WorldImagery (satelital)": ("Esri WorldImagery", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                                      "Tiles © Esri")
+}
+
+# Agregar varias opciones de base para alternar
+for name, (label, url, attr) in base_tiles.items():
+    if url is None:
+        folium.TileLayer(tiles=label, name=name, control=True).add_to(m)
+    else:
+        folium.TileLayer(tiles=url, name=name, attr=attr, control=True).add_to(m)
+
+# Marcadores
+valid_points = df_filtered.dropna(subset=[lat_col, lon_col]).copy()
+
+if show_markers and not valid_points.empty:
+    if use_cluster:
+        mc = MarkerCluster(name="Clúster de puntos")
+        mc.add_to(m)
+    for i, r in valid_points.iterrows():
+        lat, lon = float(r[lat_col]), float(r[lon_col])
+        popup_fields = []
+        for c in df_filtered.columns:
+            val = r[c]
+            if pd.isna(val):
+                continue
+            # mostrar fechas legibles
+            if isinstance(val, (pd.Timestamp, np.datetime64)):
+                try:
+                    val = pd.to_datetime(val).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pass
+            popup_fields.append(f"<b>{c}:</b> {val}")
+        popup_html = "<br>".join(popup_fields)
+        marker = folium.Marker(location=[lat, lon], popup=folium.Popup(popup_html, max_width=400))
+        if use_cluster:
+            marker.add_to(mc)
+        else:
+            marker.add_to(m)
+
+# Heatmap (con gradiente más rojizo)
+if show_heatmap and not valid_points.empty:
+    heat_data = valid_points[[lat_col, lon_col]].dropna().values.tolist()
+    if len(heat_data) >= 2:  # HeatMap requiere al menos 2 puntos para ser útil
+        HeatMap(
+            heat_data,
+            radius=heat_radius,
+            blur=heat_blur,
+            gradient={0.2: "#ffffb2", 0.4: "#fecc5c", 0.6: "#fd8d3c", 0.8: "#f03b20", 1.0: "#bd0026"},
+            name="Mapa de calor"
+        ).add_to(m)
+
+# Distancias: pares dentro de umbral y líneas
+pairs_df = pd.DataFrame()
+if distance_enable and not valid_points.empty and len(valid_points) >= 2:
+    pts = valid_points[[lat_col, lon_col]].to_numpy(dtype=float)
+    idx = valid_points.index.to_list()
+
+    rows = []
+    for a in range(len(pts)):
+        for b in range(a + 1, len(pts)):
+            lat1, lon1 = pts[a]
+            lat2, lon2 = pts[b]
+            d = haversine_m(lat1, lon1, lat2, lon2)
+            if d <= distance_threshold_m:
+                rows.append({
+                    "idx_1": idx[a],
+                    "idx_2": idx[b],
+                    "lat1": lat1, "lon1": lon1,
+                    "lat2": lat2, "lon2": lon2,
+                    "dist_m": round(float(d), 2)
+                })
+    if rows:
+        pairs_df = pd.DataFrame(rows).sort_values("dist_m")
+        # Dibujar líneas
+        for _, rr in pairs_df.iterrows():
+            folium.PolyLine(
+                locations=[(rr["lat1"], rr["lon1"]), (rr["lat2"], rr["lon2"])],
+                color="#d62728", weight=3, opacity=0.8
+            ).add_to(m)
+
+# Controles extra
+folium.LayerControl(collapsed=False).add_to(m)
+MeasureControl(position='topright', primary_length_unit='meters').add_to(m)
+
+# Render mapa
+map_out = st_folium(m, use_container_width=True, returned_objects=[])
+
+# ===================== TABLAS DE APOYO =====================
+
+st.markdown("### 📄 Datos filtrados")
+st.dataframe(df_filtered, use_container_width=True)
+
+if distance_enable and not pairs_df.empty:
+    st.markdown(f"### 📏 Pares de puntos a ≤ {distance_threshold_m} m")
+    # Agregar columnas con tiempos si existen
+    for tcol in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
+        if tcol in df_filtered.columns:
+            # traer tiempos de los índices de cada par
+            pairs_df[f"{tcol}_1"] = df_filtered.loc[pairs_df["idx_1"], tcol].values
+            pairs_df[f"{tcol}_2"] = df_filtered.loc[pairs_df["idx_2"], tcol].values
+    st.dataframe(pairs_df.drop(columns=["lat1","lon1","lat2","lon2"]), use_container_width=True)
+
+st.info(
+    "Tip: Ajusta la **ventana de tiempo** en minutos para detectar posibles respuestas duplicadas exactas, "
+    "y el **umbral de distancia** para ver pares de puntos cercanos unidos por líneas."
+)

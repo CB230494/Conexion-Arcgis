@@ -75,7 +75,6 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
                     "hash": h,
                     "indices": gb["_row_i"].tolist()  # índices del df original
                 }
-                # Columna de contenido de referencia (opcional para vista)
                 for c in content_cols:
                     row[c] = norm_df.loc[gb.index[0], c]
                 results.append(row)
@@ -169,37 +168,45 @@ else:
 
     # Panel de limpieza
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
-        # listado amigable de grupos
+        # -------- CORRECCIÓN: construir 'dupes_show' y usarlo para armar 'opciones' --------
         dupes_show = dupes[["conteo_duplicados","primero","ultimo","ventana_min","indices"]].copy()
-        dupes_show["rango"] = dupes_show["primero"].dt.strftime("%Y-%m-%d %H:%M").fillna("-") + " → " + \
-                              dupes_show["ultimo"].dt.strftime("%Y-%m-%d %H:%M").fillna("-")
-        dupes_show = dupes_show.drop(columns=["primero","ultimo"])
-        st.dataframe(dupes_show, use_container_width=True)
 
-        opciones = [f"Grupo {i+1} – {row['conteo_duplicados']} elementos – {row['rango']}"
-                    for i, (_, row) in enumerate(dupes.iterrows())]
+        def fmt_dt(x):
+            try:
+                return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return "-"
+
+        dupes_show["rango"] = dupes_show["primero"].apply(fmt_dt) + " → " + dupes_show["ultimo"].apply(fmt_dt)
+        st.dataframe(dupes_show.drop(columns=["primero","ultimo"]), use_container_width=True)
+
+        # Usamos dupes_show (que sí tiene 'rango') para las opciones
+        opciones = [
+            f"Grupo {i+1} – {row['conteo_duplicados']} elementos – {row['rango']}"
+            for i, row in dupes_show.reset_index(drop=True).iterrows()
+        ]
+
         seleccion = st.multiselect("Selecciona grupos a limpiar (o deja vacío para todos):", opciones)
 
         criterio = st.radio("Criterio de conservación (¿cuál se queda en cada grupo?)",
                             ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
 
-        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list):
+        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list, opciones_txt: list):
             df_out = df_in.copy()
-            # map de opción a índices
-            selected_rows = list(range(len(dupes_df)))  # por defecto todos
+            # por defecto todos
+            selected_rows = list(range(len(dupes_df)))
             if seleccion_opciones:
-                selected_rows = [opciones.index(s) for s in seleccion_opciones]
+                selected_rows = [opciones_txt.index(s) for s in seleccion_opciones]
 
             for pos in selected_rows:
                 idxs = dupes_df.iloc[pos]["indices"]
-                # decidir cuál conservar
                 sub = df_out.loc[idxs]
                 if time_col in df_out.columns:
+                    # argsort con mergesort (estable) por NaT al principio; luego tomamos extremo
                     orden = sub[time_col].argsort(kind="mergesort")
                     keep = sub.index[orden[-1]] if criterio.startswith("Mantener el más reciente") else sub.index[orden[0]]
                 else:
-                    keep = idxs[0]  # fallback
-                # eliminar todos menos keep
+                    keep = idxs[0]
                 drop_ids = [i for i in idxs if i != keep]
                 df_out = df_out.drop(index=drop_ids, errors="ignore")
             return df_out
@@ -207,7 +214,7 @@ else:
         colb1, colb2 = st.columns([1,1])
         with colb1:
             if st.button("🧹 Limpiar seleccionados / todos"):
-                st.session_state.df_clean = limpiar(st.session_state.df_clean, dupes, seleccion)
+                st.session_state.df_clean = limpiar(st.session_state.df_clean, dupes, seleccion, opciones)
                 st.success("Limpieza realizada. Actualizando tabla y mapa…")
                 st.rerun()
         with colb2:
@@ -237,6 +244,10 @@ folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Wor
 if not valid_points.empty:
     mc = MarkerCluster(name="Clúster de puntos")
     mc.add_to(m)
+    dup_set_local = set()
+    if not dupes.empty:
+        for lst in dupes["indices"]:
+            dup_set_local.update(lst)
     for idx, r in valid_points.iterrows():
         lat, lon = float(r[lat_col]), float(r[lon_col])
         popup_fields = []
@@ -247,7 +258,7 @@ if not valid_points.empty:
                 try: val = pd.to_datetime(val).strftime("%Y-%m-%d %H:%M")
                 except: pass
             popup_fields.append(f"<b>{c}:</b> {val}")
-        is_dup = idx in dup_set
+        is_dup = idx in dup_set_local
         icon = folium.Icon(color="red" if is_dup else "blue", icon="info-sign")
         folium.Marker([lat, lon], popup=folium.Popup("<br>".join(popup_fields), max_width=420), icon=icon).add_to(mc)
 
@@ -311,3 +322,4 @@ to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx")
 
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)
+

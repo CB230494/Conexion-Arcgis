@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-from datetime import datetime
 import io
 import numpy as np
 import pandas as pd
 import streamlit as st
+from datetime import datetime
 
 import folium
 from folium.plugins import MarkerCluster, HeatMap, MeasureControl
@@ -62,7 +62,8 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
     results = []
     for h, g in tmp.groupby("_hash_content", dropna=False):
         g = g.copy().sort_values(time_col)
-        if g.shape[0] < 2: continue
+        if g.shape[0] < 2:
+            continue
         g["time_diff_prev"] = g[time_col].diff()
         block_id = (g["time_diff_prev"].isna() | (g["time_diff_prev"] > win)).cumsum()
         for _, gb in g.groupby(block_id):
@@ -75,20 +76,22 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
                     "hash": h,
                     "indices": gb["_row_i"].tolist()  # índices del df original
                 }
+                # columna de contenido de referencia (opcional)
                 for c in content_cols:
                     row[c] = norm_df.loc[gb.index[0], c]
                 results.append(row)
-    if not results: return pd.DataFrame()
+    if not results:
+        return pd.DataFrame()
     return pd.DataFrame(results).sort_values(["conteo_duplicados","ultimo"], ascending=[False, False])
 
 def center_from_points(df, lon_col, lat_col):
     if df.empty or lon_col not in df.columns or lat_col not in df.columns:
-        return (10.0, -84.0)
+        return (10.0, -84.0)  # centro aprox. CR
     mlat = df[lat_col].mean(skipna=True); mlon = df[lon_col].mean(skipna=True)
     if np.isnan(mlat) or np.isnan(mlon): return (10.0, -84.0)
     return (float(mlat), float(mlon))
 
-def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", key: str = "dl_default"):
+def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", key: str = "dl_limpio_footer"):
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="datos")
@@ -98,7 +101,7 @@ def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", ke
         data=bio,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=key,  # clave única por botón
+        key=key,  # clave única
     )
 
 # ======== Sidebar mínimo (solo carga) ========
@@ -191,28 +194,52 @@ else:
         criterio = st.radio("Criterio de conservación (¿cuál se queda en cada grupo?)",
                             ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
 
-        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list, opciones_txt: list):
+        # --- FUNCIÓN DE LIMPIEZA CORREGIDA (sin argsort; usa idxmax/idxmin y controla NaT) ---
+        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list, opciones_txt: list, criterio_txt: str):
             df_out = df_in.copy()
-            selected_rows = list(range(len(dupes_df)))  # por defecto todos
+
+            # Por defecto, limpiar TODOS los grupos
+            selected_rows = list(range(len(dupes_df)))
             if seleccion_opciones:
                 selected_rows = [opciones_txt.index(s) for s in seleccion_opciones]
 
             for pos in selected_rows:
                 idxs = dupes_df.iloc[pos]["indices"]
-                sub = df_out.loc[idxs]
+
+                # Si en limpiezas previas ya se eliminaron algunas filas, intersectamos con los vivos
+                vivos = df_out.index.intersection(idxs)
+                if len(vivos) <= 1:
+                    # nada que limpiar (0 o 1 registro restante)
+                    continue
+
+                sub = df_out.loc[vivos]
+
                 if time_col in df_out.columns:
-                    orden = sub[time_col].argsort(kind="mergesort")
-                    keep = sub.index[orden[-1]] if criterio.startswith("Mantener el más reciente") else sub.index[orden[0]]
+                    ts = pd.to_datetime(sub[time_col], errors="coerce")
+                    ts_non = ts.dropna()
+
+                    if criterio_txt.startswith("Mantener el más reciente"):
+                        keep = ts_non.idxmax() if not ts_non.empty else sub.index[0]
+                    else:
+                        keep = ts_non.idxmin() if not ts_non.empty else sub.index[0]
                 else:
-                    keep = idxs[0]
-                drop_ids = [i for i in idxs if i != keep]
+                    keep = sub.index[0]
+
+                drop_ids = [i for i in sub.index if i != keep]
                 df_out = df_out.drop(index=drop_ids, errors="ignore")
+
             return df_out
 
         colb1, colb2 = st.columns([1,1])
         with colb1:
             if st.button("🧹 Limpiar seleccionados / todos"):
-                st.session_state.df_clean = limpiar(st.session_state.df_clean, dupes, seleccion, opciones)
+                st.session_state.df_clean = limpiar(
+                    st.session_state.df_clean,
+                    dupes,
+                    seleccion,
+                    opciones,
+                    criterio
+                )
                 st.success("Limpieza realizada. Actualizando tabla y mapa…")
                 st.rerun()
         with colb2:
@@ -262,6 +289,8 @@ if not valid_points.empty:
 
 # heatmap rojo
 if not valid_points.empty and len(valid_points) >= 2:
+    heat_data = valid_points[[lat_col, lat_col.replace("x","y") if lat_col=="x" else lat_col]].values.tolist()
+    # Corregimos: debemos usar [lat_col, lon_col]
     heat_data = valid_points[[lat_col, lon_col]].values.tolist()
     HeatMap(
         heat_data,
@@ -274,13 +303,13 @@ if not valid_points.empty and len(valid_points) >= 2:
 pairs = []
 if not valid_points.empty and len(valid_points) >= 2:
     pts = valid_points[[lat_col, lon_col]].to_numpy(dtype=float)
-    idx = valid_points.index.to_list()
+    idxs = valid_points.index.to_list()
     for a in range(len(pts)):
         for b in range(a + 1, len(pts)):
             lat1, lon1 = pts[a]; lat2, lon2 = pts[b]
             d = haversine_m(lat1, lon1, lat2, lon2)
             if d <= distance_threshold_m:
-                pairs.append((idx[a], idx[b], float(d), lat1, lon1, lat2, lon2))
+                pairs.append((idxs[a], idxs[b], float(d), lat1, lon1, lat2, lon2))
 if pairs:
     for _, _, d, la, lo, lb, lob in sorted(pairs, key=lambda x: x[2]):
         folium.PolyLine([(la, lo), (lb, lob)], color="#d62728", weight=3, opacity=0.8).add_to(m)
@@ -295,6 +324,7 @@ MeasureControl(position='topright',
                primary_area_unit='sqmeters',
                secondary_area_unit='hectares').add_to(m)
 
+# Traducción de textos del popup de medición al español
 from folium import Element
 script = """
 function traducirPopupMedida(){
@@ -320,4 +350,3 @@ to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx", key=
 
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)
-

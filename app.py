@@ -74,9 +74,8 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
                     "ultimo": gb[time_col].max(),
                     "ventana_min": window_minutes,
                     "hash": h,
-                    "indices": gb["_row_i"].tolist()  # índices del df original
+                    "indices": gb["_row_i"].tolist()
                 }
-                # columna de contenido de referencia (opcional)
                 for c in content_cols:
                     row[c] = norm_df.loc[gb.index[0], c]
                 results.append(row)
@@ -86,7 +85,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
 
 def center_from_points(df, lon_col, lat_col):
     if df.empty or lon_col not in df.columns or lat_col not in df.columns:
-        return (10.0, -84.0)  # centro aprox. CR
+        return (10.0, -84.0)
     mlat = df[lat_col].mean(skipna=True); mlon = df[lon_col].mean(skipna=True)
     if np.isnan(mlat) or np.isnan(mlon): return (10.0, -84.0)
     return (float(mlat), float(mlon))
@@ -101,7 +100,7 @@ def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", ke
         data=bio,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=key,  # clave única
+        key=key,
     )
 
 # ======== Sidebar mínimo (solo carga) ========
@@ -129,7 +128,7 @@ df_raw, sheet_name = load_excel_first_sheet(uploaded)
 # mantener df limpio en sesión para permitir eliminaciones
 if "df_clean" not in st.session_state:
     st.session_state.df_clean = df_raw.copy()
-df = st.session_state.df_clean  # trabajamos sobre el limpio
+df = st.session_state.df_clean
 
 # coerción de fechas si están
 for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
@@ -144,17 +143,34 @@ time_col = "CreationDate" if "CreationDate" in df.columns else (
 window_minutes = 10
 distance_threshold_m = 200
 
-# ======== Métricas ========
-c1, c2, c3, c4 = st.columns(4)
-with c1: st.metric("Total de respuestas", int(df.shape[0]))
-with c2: st.metric("Hoja detectada", sheet_name)
-if time_col in df.columns:
-    ult = df[time_col].max()
-    with c3: st.metric("Última respuesta", "-" if pd.isna(ult) else ult.strftime("%Y-%m-%d %H:%M"))
-if "¿Cómo califica la seguridad en su zona?" in df.columns:
-    seg_counts = df["¿Cómo califica la seguridad en su zona?"].astype(str).str.lower().value_counts()
-    top_seg = seg_counts.index[0] if not seg_counts.empty else "-"
-    with c4: st.metric("Calificación más frecuente", top_seg)
+# ======== Métricas (conteo más grande + fecha dd/mm/aaaa) ========
+c1, c2, c3, c4 = st.columns([1.3, 1, 1, 1])
+
+with c1:
+    total = int(df.shape[0])
+    st.markdown(
+        f"""
+        <div style="font-size:56px; font-weight:800; line-height:1; margin-bottom:2px;">{total}</div>
+        <div style="font-size:14px; opacity:0.75; margin-top:-2px;">Respuestas</div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with c2:
+    # Hoja detectada como metric normal
+    st.metric("Hoja detectada", sheet_name)
+
+with c3:
+    if time_col in df.columns:
+        ult = df[time_col].max()
+        fecha_txt = "-" if pd.isna(ult) else pd.to_datetime(ult).strftime("%d/%m/%Y")
+        st.metric("Última respuesta", fecha_txt)
+
+with c4:
+    if "¿Cómo califica la seguridad en su zona?" in df.columns:
+        seg_counts = df["¿Cómo califica la seguridad en su zona?"].astype(str).str.lower().value_counts()
+        top_seg = seg_counts.index[0] if not seg_counts.empty else "-"
+        st.metric("Calificación más frecuente", top_seg)
 
 # ======== Duplicados exactos (ventana 10 min) ========
 st.markdown("### 🧪 Duplicados exactos en ≤ 10 min")
@@ -166,25 +182,21 @@ if dupes.empty:
     st.success("No se detectaron grupos de respuestas EXACTAMENTE iguales en la ventana indicada.")
 else:
     st.warning(f"Se detectaron {dupes.shape[0]} grupo(s) de posibles duplicados exactos.")
-    # construir set de índices duplicados
     for lst in dupes["indices"]:
         dup_set.update(lst)
 
-    # Panel de limpieza
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
-        # Tabla con rango de fechas
         dupes_show = dupes[["conteo_duplicados","primero","ultimo","ventana_min","indices"]].copy()
 
         def fmt_dt(x):
             try:
-                return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
+                return pd.to_datetime(x).strftime("%d/%m/%Y")
             except Exception:
                 return "-"
 
         dupes_show["rango"] = dupes_show["primero"].apply(fmt_dt) + " → " + dupes_show["ultimo"].apply(fmt_dt)
         st.dataframe(dupes_show.drop(columns=["primero","ultimo"]), use_container_width=True)
 
-        # Opciones para seleccionar grupos (usamos dupes_show que sí tiene 'rango')
         opciones = [
             f"Grupo {i+1} – {row['conteo_duplicados']} elementos – {row['rango']}"
             for i, row in dupes_show.reset_index(drop=True).iterrows()
@@ -194,22 +206,16 @@ else:
         criterio = st.radio("Criterio de conservación (¿cuál se queda en cada grupo?)",
                             ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
 
-        # --- FUNCIÓN DE LIMPIEZA CORREGIDA (sin argsort; usa idxmax/idxmin y controla NaT) ---
         def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, seleccion_opciones: list, opciones_txt: list, criterio_txt: str):
             df_out = df_in.copy()
-
-            # Por defecto, limpiar TODOS los grupos
             selected_rows = list(range(len(dupes_df)))
             if seleccion_opciones:
                 selected_rows = [opciones_txt.index(s) for s in seleccion_opciones]
 
             for pos in selected_rows:
                 idxs = dupes_df.iloc[pos]["indices"]
-
-                # Si en limpiezas previas ya se eliminaron algunas filas, intersectamos con los vivos
                 vivos = df_out.index.intersection(idxs)
                 if len(vivos) <= 1:
-                    # nada que limpiar (0 o 1 registro restante)
                     continue
 
                 sub = df_out.loc[vivos]
@@ -217,7 +223,6 @@ else:
                 if time_col in df_out.columns:
                     ts = pd.to_datetime(sub[time_col], errors="coerce")
                     ts_non = ts.dropna()
-
                     if criterio_txt.startswith("Mantener el más reciente"):
                         keep = ts_non.idxmax() if not ts_non.empty else sub.index[0]
                     else:
@@ -234,11 +239,7 @@ else:
         with colb1:
             if st.button("🧹 Limpiar seleccionados / todos"):
                 st.session_state.df_clean = limpiar(
-                    st.session_state.df_clean,
-                    dupes,
-                    seleccion,
-                    opciones,
-                    criterio
+                    st.session_state.df_clean, dupes, seleccion, opciones, criterio
                 )
                 st.success("Limpieza realizada. Actualizando tabla y mapa…")
                 st.rerun()
@@ -280,7 +281,7 @@ if not valid_points.empty:
             val = r[c]
             if pd.isna(val): continue
             if isinstance(val, (pd.Timestamp, np.datetime64)):
-                try: val = pd.to_datetime(val).strftime("%Y-%m-%d %H:%M")
+                try: val = pd.to_datetime(val).strftime("%d/%m/%Y %H:%M")
                 except: pass
             popup_fields.append(f"<b>{c}:</b> {val}")
         is_dup = idx in dup_set_local
@@ -289,8 +290,6 @@ if not valid_points.empty:
 
 # heatmap rojo
 if not valid_points.empty and len(valid_points) >= 2:
-    heat_data = valid_points[[lat_col, lat_col.replace("x","y") if lat_col=="x" else lat_col]].values.tolist()
-    # Corregimos: debemos usar [lat_col, lon_col]
     heat_data = valid_points[[lat_col, lon_col]].values.tolist()
     HeatMap(
         heat_data,
@@ -324,7 +323,6 @@ MeasureControl(position='topright',
                primary_area_unit='sqmeters',
                secondary_area_unit='hectares').add_to(m)
 
-# Traducción de textos del popup de medición al español
 from folium import Element
 script = """
 function traducirPopupMedida(){
@@ -350,3 +348,4 @@ to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx", key=
 
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)
+

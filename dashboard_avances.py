@@ -11,13 +11,12 @@ from folium.plugins import MarkerCluster, HeatMap, MeasureControl
 from streamlit_folium import st_folium
 from folium import Element
 
-# PDF (Platypus para ajuste automático de texto)
+# PDF (Platypus: envuelve texto largo)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="Dashboard de Avances – Encuestas", layout="wide")
@@ -55,7 +54,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
 
     win = pd.Timedelta(minutes=window_minutes)
     out = []
-    for h, g in tmp.groupby("_hash_content", dropna=False):
+    for _, g in tmp.groupby("_hash_content", dropna=False):
         g = g.copy().sort_values(time_col)
         if len(g) < 2: 
             continue
@@ -103,12 +102,10 @@ def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", ke
 def reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes):
     """Texto explicativo del porqué del duplicado para un grupo."""
     sub = df.loc[idxs].copy()
-    # misma ubicación exacta (coordenadas idénticas) – tolerancia por redondeo
     same_place = False
     if lon_col in sub.columns and lat_col in sub.columns:
         coords = sub[[lon_col, lat_col]].round(6).dropna()
         same_place = (len(coords.drop_duplicates()) == 1) and (len(coords) == len(sub))
-    # rango horario
     rango = ""
     try:
         primero = pd.to_datetime(sub[time_col], errors="coerce").min()
@@ -188,26 +185,31 @@ if dupes.empty:
     st.success("✅ No se detectaron duplicados. No hay nada que limpiar.")
 else:
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
-        # Preparar vista de grupos
-        detalle_dupes_ui = []
-        rows = []
+        # ---- MOSTRAR BONITO (Streamlit) ----
+        filas = []
+        explicaciones = []
         for i, row in dupes.iterrows():
             idxs = row["indices"]
             motivo, rango = reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes)
-            rows.append([f"Grupo {i+1}", int(row["conteo_duplicados"]), max(0, int(row["conteo_duplicados"])-1), rango, motivo])
-            detalle_dupes_ui.append((idxs, motivo, rango))
-        tbl = Table([["Grupo", "Respuestas", "Se eliminarán", "Rango", "Motivo"]] + rows, colWidths=[2.2*cm, 3*cm, 3.2*cm, 5*cm, None])
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND",(0,0),(-1,0), colors.Color(0.2,0.2,0.2)),
-            ("TEXTCOLOR",(0,0),(-1,0), colors.white),
-            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-            ("ALIGN",(1,1),(2,-1),"CENTER"),
-            ("VALIGN",(0,0),(-1,-1),"TOP"),
-            ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
-        ]))
-        st.write("**Resumen de duplicados detectados**")
-        st.write(tbl)
+            filas.append({
+                "Grupo": f"Grupo {i+1}",
+                "Respuestas": int(row["conteo_duplicados"]),
+                "Se eliminarán": max(0, int(row["conteo_duplicados"])-1),
+                "Rango": rango or "-",
+                "Motivo": motivo
+            })
+            explicaciones.append(
+                f"**Grupo {i+1}**: {int(row['conteo_duplicados'])} respuestas → "
+                f"se eliminarán {max(0, int(row['conteo_duplicados'])-1)} y **se conservará 1**. "
+                f"Rango: {rango or '-'} · Motivo: {motivo}"
+            )
+        df_vista = pd.DataFrame(filas)
+        st.dataframe(df_vista, use_container_width=True)
+        st.markdown("—")
+        for txt in explicaciones:
+            st.markdown(f"- {txt}")
 
+        # ---- Controles de limpieza ----
         criterio = st.radio("¿Cuál conservar en cada grupo?",
                             ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
 
@@ -325,10 +327,10 @@ map_html_bytes = m.get_root().render().encode("utf-8")
 st.download_button("⬇️ Descargar mapa (HTML)", data=map_html_bytes,
                    file_name="mapa_encuestas.html", mime="text/html", key="dl_html_mapa")
 
-# ======== Armar contenido detallado para PDF ========
+# ======== Preparar detalle para PDF ========
 detalle_dupes = []
 if not dupes_now.empty:
-    for _, row in dupes_now.iterrows():
+    for i, row in dupes_now.iterrows():
         idxs = row["indices"]
         motivo, rango = reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes)
         detalle_dupes.append({
@@ -339,7 +341,7 @@ if not dupes_now.empty:
             "motivo": motivo
         })
 
-# ======== PDF con Platypus (textos se ajustan a los márgenes) ========
+# ======== PDF con Platypus (ajuste de texto) ========
 def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png_bytes: bytes | None, mapa_final_png_bytes: bytes | None) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
@@ -362,36 +364,40 @@ def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png_bytes: bytes | No
     flow.append(Paragraph(bullets, styles["Body"]))
     flow.append(Spacer(1, 8))
 
-    # Caso: sin duplicados
+    # Detalle duplicados
     if not detalle_dupes:
         flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas las respuestas cargadas están validadas.", styles["Body"]))
         flow.append(Spacer(1, 12))
     else:
         flow.append(Paragraph("Detalle de respuestas duplicadas", styles["H2b"]))
         for i, d in enumerate(detalle_dupes, start=1):
-            flow.append(Paragraph(f"<b>Grupo {i}</b> – {d['conteo']} respuestas (se eliminarán {d['eliminar']}, quedará 1).", styles["Body"]))
+            flow.append(Paragraph(
+                f"<b>Grupo {i}</b> – {d['conteo']} respuestas (se eliminarán {d['eliminar']}, quedará 1).",
+                styles["Body"]
+            ))
             flow.append(Paragraph(f"Rango temporal: {d['rango'] or '-'}", styles["Body"]))
-            # indices como texto monoespaciado envuelto
             flow.append(Paragraph(f"Índices/IDs: {', '.join(map(str, d['indices']))}", styles["Mono"]))
             flow.append(Paragraph(f"Motivo: {d['motivo']}", styles["Body"]))
             flow.append(Spacer(1, 8))
 
     # Evidencias
-    if mapa_dup_png_bytes or mapa_final_png_bytes:
+    if mapa_dup_png is not None or mapa_final_png_bytes is not None:
         flow.append(Paragraph("Evidencias visuales", styles["H2b"]))
-        def add_img(png_bytes, caption):
-            if not png_bytes: return
-            img = ImageReader(io.BytesIO(png_bytes))
-            iw, ih = img.getSize()
-            max_w = A4[0] - 4*cm
-            max_h = A4[1] / 2.2
-            ratio = min(max_w/iw, max_h/ih)
-            w, h = iw*ratio, ih*ratio
-            flow.append(Image(io.BytesIO(png_bytes), width=w, height=h))
-            flow.append(Paragraph(caption, styles["Body"]))
-            flow.append(Spacer(1, 8))
-        add_img(mapa_dup_png_bytes, "Mapa con duplicadas (marcadas en rojo).")
-        add_img(mapa_final_png_bytes, "Mapa final (respuestas validadas).")
+
+    def add_img(png_bytes, caption):
+        if not png_bytes: return
+        img = ImageReader(io.BytesIO(png_bytes))
+        iw, ih = img.getSize()
+        max_w = A4[0] - 4*cm
+        max_h = A4[1] / 2.2
+        ratio = min(max_w/iw, max_h/ih)
+        w, h = iw*ratio, ih*ratio
+        flow.append(Image(io.BytesIO(png_bytes), width=w, height=h))
+        flow.append(Paragraph(caption, styles["Body"]))
+        flow.append(Spacer(1, 8))
+
+    add_img(mapa_dup_png_bytes, "Mapa con duplicadas (marcadas en rojo).")
+    add_img(mapa_final_png_bytes, "Mapa final (respuestas validadas).")
 
     doc.build(flow)
     buffer.seek(0)
@@ -420,4 +426,5 @@ st.download_button(
 # ======== Tabla rápida ========
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(df.head(1000), use_container_width=True)
+
 

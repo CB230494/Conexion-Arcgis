@@ -26,27 +26,38 @@ st.caption("Conteos grandes, mapa, descarga de PNG y PDF de avance.")
 # ======== Utilidades ========
 META_COLS = {"ObjectID", "GlobalID", "instance_id", "CreationDate", "EditDate", "Creator", "Editor"}
 
-def normalize_string(s: str) -> str:
-    if pd.isna(s): return ""
-    s = str(s).strip().lower()
+def normalize_string(x) -> str:
+    """Normaliza un valor escalar a string limpio en minúscula (maneja NaN)."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().lower()
     return " ".join(s.split())
 
-def normalize_factors(s: str) -> str:
-    if pd.isna(s): return ""
-    parts = [normalize_string(p) for p in str(s).replace(";", ",").split(",")]
-    parts = [p for p in parts if p]
+def normalize_factors(x) -> str:
+    """
+    Normaliza un valor escalar de factores tipo 'a, b; c' a 'a,b,c' ordenado.
+    (Se usa con .apply sobre la Serie)
+    """
+    if pd.isna(x):
+        return ""
+    parts = str(x).replace(";", ",").split(",")
+    parts = [normalize_string(p) for p in parts if normalize_string(p)]
     parts.sort()
     return ",".join(parts)
 
 def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list):
     """Grupos de duplicados exactos (mismo contenido normalizado) en ventana corta."""
-    if df.empty or not content_cols: return pd.DataFrame()
+    if df.empty or not content_cols:
+        return pd.DataFrame()
     tmp = df.copy()
 
-    # normalizar contenido
+    # normalizar contenido (APLICANDO función por elemento)
     normalized = {}
     for c in content_cols:
-        normalized[c] = normalize_factors(tmp[c]) if "factor" in c.lower() else tmp[c].apply(normalize_string)
+        if "factor" in c.lower():
+            normalized[c] = tmp[c].apply(normalize_factors)
+        else:
+            normalized[c] = tmp[c].apply(normalize_string)
     norm_df = pd.DataFrame(normalized)
 
     key = pd.util.hash_pandas_object(norm_df, index=False)
@@ -59,18 +70,18 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
     results = []
     for h, g in tmp.groupby("_hash_content", dropna=False):
         g = g.copy().sort_values(time_col)
-        if len(g) < 2: continue
+        if len(g) < 2:
+            continue
         g["time_diff_prev"] = g[time_col].diff()
         block_id = (g["time_diff_prev"].isna() | (g["time_diff_prev"] > win)).cumsum()
         for _, gb in g.groupby(block_id):
             if len(gb) >= 2:
-                row = {
+                results.append({
                     "conteo_duplicados": len(gb),
                     "primero": gb[time_col].min(),
                     "ultimo": gb[time_col].max(),
                     "indices": gb["_row_i"].tolist()
-                }
-                results.append(row)
+                })
     return pd.DataFrame(results)
 
 def center_from_points(df, lon_col, lat_col):
@@ -117,7 +128,6 @@ def build_pdf(conteos: dict, mapa_png_bytes: bytes | None) -> bytes:
     if mapa_png_bytes:
         try:
             img = ImageReader(io.BytesIO(mapa_png_bytes))
-            # Dimensiones aprox dentro de la página
             max_w = W - 4*cm
             max_h = H/2.0
             iw, ih = img.getSize()
@@ -170,7 +180,7 @@ lon_col, lat_col = "x", "y"
 time_col = "CreationDate" if "CreationDate" in df.columns else ("EditDate" if "EditDate" in df.columns else "¿Cuándo fue el último incidente?")
 window_minutes = 10
 
-# Duplicados exactos
+# Duplicados exactos (¡arreglo aplicado!)
 content_cols = [c for c in df.columns if c not in META_COLS | {lon_col, lat_col}]
 dupes = detect_duplicates(df, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
 
@@ -294,7 +304,6 @@ conteos = {
     "Se eliminarían (dejando 1 por grupo)": eliminadas_si_limpio,
     "Última respuesta": "-" if pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y")
 }
-
 png_bytes = map_png.read() if map_png is not None else None
 pdf_bytes = build_pdf(conteos, png_bytes)
 st.download_button(

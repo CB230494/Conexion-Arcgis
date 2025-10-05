@@ -15,7 +15,7 @@ from folium import Element
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
@@ -62,7 +62,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
     out = []
     for _, g in tmp.groupby("_hash_content", dropna=False):
         g = g.copy().sort_values(time_col)
-        if len(g) < 2: 
+        if len(g) < 2:
             continue
         g["time_diff_prev"] = g[time_col].diff()
         block_id = (g["time_diff_prev"].isna() | (g["time_diff_prev"] > win)).cumsum()
@@ -130,9 +130,8 @@ st.sidebar.header("Cargar Excel")
 uploaded = st.sidebar.file_uploader("Sube un archivo .xlsx", type=["xlsx"])
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Evidencias para PDF (opcional)")
-map_dup_png = st.sidebar.file_uploader("Mapa con duplicadas (PNG)", type=["png"])
-map_final_png = st.sidebar.file_uploader("Mapa final validado (PNG)", type=["png"])
+st.sidebar.subheader("Evidencias para PDF (puedes subir varias PNG)")
+evidence_png_files = st.sidebar.file_uploader("Sube 1 o más imágenes (PNG)", type=["png"], accept_multiple_files=True)
 
 # ======== Carga de datos ========
 @st.cache_data(show_spinner=False)
@@ -173,12 +172,30 @@ total = len(df)
 duplicadas = int(dupes["conteo_duplicados"].sum()) if not dupes.empty else 0
 eliminar_por_grupo = int(sum(max(0, n-1) for n in (dupes["conteo_duplicados"] if not dupes.empty else [])))
 validadas = total - eliminar_por_grupo
+ultima_fecha = "-" if time_col not in df.columns or pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y")
 
 c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1])
 with c1: big_number("Respuestas totales", f"{total}")
 with c2: big_number("Duplicadas detectadas", f"{duplicadas}")
 with c3: big_number("Se eliminarán (1 por grupo)", f"{eliminar_por_grupo}")
 with c4: big_number("Quedarán validadas", f"{validadas}")
+
+# ---- CARD / CUADRO RESUMEN EN LA APP ----
+st.markdown(
+    f"""
+    <div style="border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.04);
+                border-radius:12px;padding:14px 16px;margin:8px 0;">
+      <div style="font-weight:700;font-size:18px;margin-bottom:8px;">Resumen</div>
+      <div style="display:grid;grid-template-columns: 1fr 1fr;gap:8px 20px;font-size:15px;">
+        <div><b>Respuestas totales:</b> {total}</div>
+        <div><b>Duplicadas detectadas:</b> {duplicadas}</div>
+        <div><b>Se eliminarán (1 por grupo):</b> {eliminar_por_grupo}</div>
+        <div><b>Quedarán validadas:</b> {validadas}</div>
+        <div><b>Última respuesta:</b> {ultima_fecha}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True
+)
 
 st.info(
     f"Un **duplicado** es un grupo de respuestas con **exactamente la misma información** "
@@ -191,7 +208,6 @@ if dupes.empty:
     st.success("✅ No se detectaron duplicados. No hay nada que limpiar.")
 else:
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
-        # ---- MOSTRAR BONITO (Streamlit) ----
         filas = []
         explicaciones = []
         for i, row in dupes.iterrows():
@@ -215,7 +231,6 @@ else:
         for txt in explicaciones:
             st.markdown(f"- {txt}")
 
-        # ---- Controles de limpieza ----
         criterio = st.radio("¿Cuál conservar en cada grupo?",
                             ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
 
@@ -262,6 +277,7 @@ valid_points = df.dropna(subset=[lat_col, lon_col]).copy()
 for c in [lat_col, lon_col]:
     if c in valid_points.columns:
         valid_points[c] = pd.to_numeric(valid_points[c], errors="coerce")
+valid_points = valid_points.dropna(subset=[lat_col, lat_col], errors="ignore")
 valid_points = valid_points.dropna(subset=[lat_col, lon_col])
 
 center_lat, center_lon = center_from_points(valid_points, lon_col, lat_col)
@@ -347,10 +363,9 @@ if not dupes_now.empty:
             "motivo": motivo
         })
 
-# ======== PDF con Platypus (ajuste de texto) ========
+# ======== PDF con Platypus (ajuste de texto + evidencias paginadas) ========
 def build_pdf(report_title: str, conteos: dict, detalle_dupes: list,
-              mapa_dup_png_bytes: bytes | None,
-              mapa_final_png_bytes: bytes | None) -> bytes:
+              evidence_images: list[bytes]) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
@@ -384,10 +399,9 @@ def build_pdf(report_title: str, conteos: dict, detalle_dupes: list,
     flow.append(table)
     flow.append(Spacer(1, 10))
 
-    # ---- Detalle duplicados (IDs con misma fuente que el cuerpo) ----
+    # ---- Detalle duplicados ----
     if not detalle_dupes:
         flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas las respuestas cargadas están validadas.", styles["Body"]))
-        flow.append(Spacer(1, 12))
     else:
         flow.append(Paragraph("Detalle de respuestas duplicadas", styles["H2b"]))
         for i, d in enumerate(detalle_dupes, start=1):
@@ -396,30 +410,50 @@ def build_pdf(report_title: str, conteos: dict, detalle_dupes: list,
                 styles["Body"]
             ))
             flow.append(Paragraph(f"Rango temporal: {d['rango'] or '-'}", styles["Body"]))
-            # IDs en estilo Body (no monoespaciado)
             flow.append(Paragraph(f"Índices/IDs: {', '.join(map(str, d['indices']))}", styles["Body"]))
             flow.append(Paragraph(f"Motivo: {d['motivo']}", styles["Body"]))
-            flow.append(Spacer(1, 8))
+            flow.append(Spacer(1, 6))
 
-    # ---- Evidencias ----
-    if (mapa_dup_png_bytes is not None) or (mapa_final_png_bytes is not None):
+    # ---- Evidencias: nueva página, tamaños moderados, 1 o 2 por página ----
+    if evidence_images:
+        flow.append(PageBreak())
         flow.append(Paragraph("Evidencias visuales", styles["H2b"]))
+        flow.append(Spacer(1, 6))
 
-    def add_img(png_bytes, caption):
-        if not png_bytes:
-            return
-        img = ImageReader(io.BytesIO(png_bytes))
-        iw, ih = img.getSize()
-        max_w = A4[0] - 4*cm
-        max_h = A4[1] / 2.2
-        ratio = min(max_w/iw, max_h/ih)
-        w, h = iw*ratio, ih*ratio
-        flow.append(Image(io.BytesIO(png_bytes), width=w, height=h))
-        flow.append(Paragraph(caption, styles["Body"]))
-        flow.append(Spacer(1, 8))
+        # parámetros de escala
+        max_w = A4[0] - 4*cm       # ancho útil
+        max_h = A4[1] / 2.4        # alto máx. general (recortado para que no llenen toda la hoja)
+        two_per_page_threshold = 8*cm  # si la imagen escalada mide <= 8 cm de alto, podemos poner 2 por página
 
-    add_img(mapa_dup_png_bytes, "Mapa con duplicadas (marcadas en rojo).")
-    add_img(mapa_final_png_bytes, "Mapa final (respuestas validadas).")
+        # helper para obtener flowable + dims escaladas
+        def scaled_image_flowable(png_bytes):
+            imgR = ImageReader(io.BytesIO(png_bytes))
+            iw, ih = imgR.getSize()
+            ratio = min(max_w/iw, max_h/ih)
+            w, h = iw*ratio, ih*ratio
+            return Image(io.BytesIO(png_bytes), width=w, height=h), w, h
+
+        # Primera imagen en la primera página de evidencias
+        img0, w0, h0 = scaled_image_flowable(evidence_images[0])
+        flow.append(img0)
+        flow.append(Spacer(1, 6))
+        # El resto
+        i = 1
+        while i < len(evidence_images):
+            img1, w1, h1 = scaled_image_flowable(evidence_images[i])
+            if i+1 < len(evidence_images):
+                img2, w2, h2 = scaled_image_flowable(evidence_images[i+1])
+                # si ambas son "pequeñas", ponemos 2 en la misma página
+                if (h1 <= two_per_page_threshold) and (h2 <= two_per_page_threshold):
+                    flow.append(img1); flow.append(Spacer(1, 6))
+                    flow.append(img2)
+                    flow.append(PageBreak())
+                    i += 2
+                    continue
+            # si no, una sola por página
+            flow.append(img1)
+            flow.append(PageBreak())
+            i += 1
 
     doc.build(flow)
     buffer.seek(0)
@@ -432,11 +466,11 @@ conteos_pdf = {
     "Duplicadas detectadas": duplicadas if not dupes.empty else 0,
     "Se eliminarán (1 por grupo)": eliminar_por_grupo if not dupes.empty else 0,
     "Quedarán validadas": validadas,
-    "Última respuesta": "-" if time_col not in df.columns or pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y"),
+    "Última respuesta": ultima_fecha,
 }
-dup_png_bytes = map_dup_png.read() if map_dup_png else None
-final_png_bytes = map_final_png.read() if map_final_png else None
-pdf_bytes = build_pdf(REPORT_TITLE, conteos_pdf, detalle_dupes, dup_png_bytes, final_png_bytes)
+# leer bytes de todas las evidencias
+evidences_bytes = [f.read() for f in evidence_png_files] if evidence_png_files else []
+pdf_bytes = build_pdf(REPORT_TITLE, conteos_pdf, detalle_dupes, evidences_bytes)
 st.download_button(
     "⬇️ Descargar PDF de avance",
     data=pdf_bytes,
@@ -448,4 +482,3 @@ st.download_button(
 # ======== Tabla rápida ========
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(df.head(1000), use_container_width=True)
-

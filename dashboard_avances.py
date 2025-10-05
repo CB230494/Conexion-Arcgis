@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import io, os, time, tempfile
+import io
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -11,25 +11,18 @@ from folium.plugins import MarkerCluster, HeatMap, MeasureControl
 from streamlit_folium import st_folium
 from folium import Element
 
-# PDF
-from reportlab.pdfgen import canvas
+# PDF (Platypus para ajuste automático de texto)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
-
-# ====== (Opcional) HTML -> PNG con Selenium headless ======
-SELENIUM_AVAILABLE = True
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from webdriver_manager.chrome import ChromeDriverManager
-except Exception:
-    SELENIUM_AVAILABLE = False
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="Dashboard de Avances – Encuestas", layout="wide")
 st.title("📈 Dashboard de Avances – Encuestas")
-st.caption("Conteos grandes, mapa (duplicadas en rojo), PDF con detalle y evidencias.")
+st.caption("Conteos grandes, limpieza de duplicados, mapa (duplicadas en rojo) y PDF con detalles y evidencias.")
 
 # ======== Utilidades ========
 META_COLS = {"ObjectID", "GlobalID", "instance_id", "CreationDate", "EditDate", "Creator", "Editor"}
@@ -47,7 +40,7 @@ def normalize_factors(x) -> str:
     return ",".join(parts)
 
 def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list):
-    """Identifica grupos con MISMO contenido exacto normalizado en una ventana <= window_minutes."""
+    """Identifica grupos con MISMO contenido exacto normalizado en ventana <= window_minutes."""
     if df.empty or not content_cols: return pd.DataFrame()
     tmp = df.copy()
     normalized = {}
@@ -99,40 +92,23 @@ def big_number(label: str, value: str):
         unsafe_allow_html=True
     )
 
-def html_to_png(html_bytes: bytes, width: int = 1280, height: int = 800, wait_sec: float = 2.8) -> bytes | None:
-    """Convierte HTML a PNG con Selenium headless. Devuelve bytes PNG o None si falla."""
-    if not SELENIUM_AVAILABLE:
-        return None
-    tmp_html = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-    try:
-        tmp_html.write(html_bytes); tmp_html.flush(); tmp_html.close()
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-gpu")
-        options.add_argument(f"--window-size={width},{height}")
-        driver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
-        try:
-            driver.get("file://" + tmp_html.name)
-            time.sleep(wait_sec)  # dar tiempo a Leaflet para renderizar
-            png = driver.get_screenshot_as_png()
-            return png
-        finally:
-            driver.quit()
-    except Exception:
-        return None
-    finally:
-        try: os.unlink(tmp_html.name)
-        except Exception: pass
+def to_excel_download(df: pd.DataFrame, filename: str = "datos_limpios.xlsx", key: str = "dl_excel"):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="datos")
+    bio.seek(0)
+    st.download_button("⬇️ Descargar Excel limpio", data=bio, file_name=filename,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
-def to_reason_string(df, idxs, time_col, lon_col, lat_col, window_minutes):
-    """Construye texto explicativo del porqué del duplicado para un grupo."""
+def reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes):
+    """Texto explicativo del porqué del duplicado para un grupo."""
     sub = df.loc[idxs].copy()
     # misma ubicación exacta (coordenadas idénticas) – tolerancia por redondeo
     same_place = False
     if lon_col in sub.columns and lat_col in sub.columns:
         coords = sub[[lon_col, lat_col]].round(6).dropna()
         same_place = (len(coords.drop_duplicates()) == 1) and (len(coords) == len(sub))
+    # rango horario
     rango = ""
     try:
         primero = pd.to_datetime(sub[time_col], errors="coerce").min()
@@ -142,85 +118,9 @@ def to_reason_string(df, idxs, time_col, lon_col, lat_col, window_minutes):
     except Exception:
         pass
     motivo = (f"Se detectó el mismo contenido en un lapso ≤ {window_minutes} minutos"
-              + (", en la **misma ubicación**" if same_place else "")
-              + ". Se conservará **1** respuesta y se eliminarán las demás del grupo.")
-    return motivo, rango, same_place
-
-def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png: bytes | None, mapa_final_png: bytes | None) -> bytes:
-    """Genera PDF con resumen, detalle de duplicados y hasta 2 imágenes."""
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    W, H = A4
-
-    # Encabezado
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(2*cm, H-2*cm, "Informe de Avance – Encuestas")
-    c.setFont("Helvetica", 10)
-    c.drawString(2*cm, H-2.6*cm, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
-    # Resumen
-    y = H - 4.2*cm
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(2*cm, y, "Resumen")
-    y -= 0.8*cm
-    c.setFont("Helvetica", 11)
-    for k, v in conteos.items():
-        c.drawString(2*cm, y, f"- {k}: {v}"); y -= 0.6*cm
-
-    # Detalle duplicados
-    if detalle_dupes:
-        y -= 0.2*cm
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(2*cm, y, "Detalle de respuestas duplicadas")
-        y -= 0.6*cm
-        c.setFont("Helvetica", 10)
-        for i, d in enumerate(detalle_dupes, start=1):
-            lineas = [
-                f"Grupo {i}: {d['conteo']} respuestas (se eliminarán {d['eliminar']}, quedará 1).",
-                f"Índices/IDs: {', '.join(map(str, d['indices']))}",
-                f"Rango temporal: {d['rango'] or '-'}",
-                f"Motivo: {d['motivo']}",
-            ]
-            for ln in lineas:
-                if y < 3*cm:
-                    c.showPage(); y = H - 2.5*cm
-                    c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Detalle de respuestas duplicadas (cont.)")
-                    y -= 0.6*cm; c.setFont("Helvetica", 10)
-                c.drawString(2*cm, y, f"- {ln}")
-                y -= 0.5*cm
-
-    # Imágenes
-    def draw_img(png_bytes, caption):
-        nonlocal y
-        if not png_bytes: return
-        img = ImageReader(io.BytesIO(png_bytes))
-        max_w = W - 4*cm; max_h = H/2.2
-        iw, ih = img.getSize(); ratio = min(max_w/iw, max_h/ih)
-        w, h = iw*ratio, ih*ratio
-        if y < h + 3*cm:
-            c.showPage(); y = H - 2.5*cm
-        c.drawImage(img, (W - w)/2, y - h, width=w, height=h)
-        y = y - h - 0.4*cm
-        c.setFont("Helvetica-Oblique", 9)
-        c.drawCentredString(W/2, y, caption)
-        y -= 0.6*cm
-
-    y -= 0.2*cm
-    c.setFont("Helvetica-Bold", 12)
-    if mapa_dup_png or mapa_final_png:
-        c.drawString(2*cm, y, "Evidencias visuales"); y -= 0.6*cm
-        c.setFont("Helvetica", 10)
-        if mapa_dup_png:
-            draw_img(mapa_dup_png, "Mapa con duplicadas (marcadas en rojo)")
-        if mapa_final_png:
-            draw_img(mapa_final_png, "Mapa final (respuestas validadas)")
-    c.showPage(); c.save(); buffer.seek(0)
-    return buffer.getvalue()
-
-def map_to_html_download(m: folium.Map, filename: str = "mapa_encuestas.html", key: str = "dl_html"):
-    html = m.get_root().render().encode("utf-8")
-    st.download_button("⬇️ Descargar mapa (HTML)", data=html, file_name=filename,
-                       mime="text/html", key=key)
+              + (", en la misma ubicación" if same_place else "")
+              + ". En la limpieza se conservará 1 y se eliminarán las demás.")
+    return motivo, rango
 
 # ======== Sidebar ========
 st.sidebar.header("Cargar Excel")
@@ -228,8 +128,8 @@ uploaded = st.sidebar.file_uploader("Sube un archivo .xlsx", type=["xlsx"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Evidencias para PDF (opcional)")
-map_dup_any = st.sidebar.file_uploader("Mapa con duplicadas (PNG o HTML)", type=["png","html"])
-map_final_any = st.sidebar.file_uploader("Mapa final validado (PNG o HTML)", type=["png","html"])
+map_dup_png = st.sidebar.file_uploader("Mapa con duplicadas (PNG)", type=["png"])
+map_final_png = st.sidebar.file_uploader("Mapa final validado (PNG)", type=["png"])
 
 # ======== Carga de datos ========
 @st.cache_data(show_spinner=False)
@@ -245,7 +145,13 @@ def load_excel_first_sheet(file_like):
 if not uploaded:
     st.info("Sube un Excel (.xlsx) en la barra lateral para comenzar."); st.stop()
 
-df, sheet_name = load_excel_first_sheet(uploaded)
+df_raw, sheet_name = load_excel_first_sheet(uploaded)
+
+# Mantener un DF que podamos limpiar
+if "df_clean" not in st.session_state:
+    st.session_state.df_clean = df_raw.copy()
+
+df = st.session_state.df_clean  # trabajaremos sobre df_clean
 
 # Fechas & columnas clave
 for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
@@ -255,23 +161,16 @@ lon_col, lat_col = "x", "y"
 time_col = "CreationDate" if "CreationDate" in df.columns else ("EditDate" if "EditDate" in df.columns else "¿Cuándo fue el último incidente?")
 window_minutes = 10
 
-# Duplicados
+# Duplicados (sobre df_clean actual)
 content_cols = [c for c in df.columns if c not in META_COLS | {lon_col, lat_col}]
 dupes = detect_duplicates(df, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
 
-# Conjunto de índices duplicados (para marcar en mapa)
-dup_set = set()
-if not dupes.empty:
-    for lst in dupes["indices"]:
-        dup_set.update(lst)
-
-# Conteos
+# KPIs
 total = len(df)
 duplicadas = int(dupes["conteo_duplicados"].sum()) if not dupes.empty else 0
 eliminar_por_grupo = int(sum(max(0, n-1) for n in (dupes["conteo_duplicados"] if not dupes.empty else [])))
 validadas = total - eliminar_por_grupo
 
-# Métricas
 c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1])
 with c1: big_number("Respuestas totales", f"{total}")
 with c2: big_number("Duplicadas detectadas", f"{duplicadas}")
@@ -284,8 +183,72 @@ st.info(
     f"**mantiene 1** y se **eliminan** las demás; por eso, de {total} pasarían a **{validadas}** respuestas validadas."
 )
 
-# ============= MAPA (duplicadas en ROJO) =============
+# ======== Limpieza de duplicados ========
+if dupes.empty:
+    st.success("✅ No se detectaron duplicados. No hay nada que limpiar.")
+else:
+    with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
+        # Preparar vista de grupos
+        detalle_dupes_ui = []
+        rows = []
+        for i, row in dupes.iterrows():
+            idxs = row["indices"]
+            motivo, rango = reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes)
+            rows.append([f"Grupo {i+1}", int(row["conteo_duplicados"]), max(0, int(row["conteo_duplicados"])-1), rango, motivo])
+            detalle_dupes_ui.append((idxs, motivo, rango))
+        tbl = Table([["Grupo", "Respuestas", "Se eliminarán", "Rango", "Motivo"]] + rows, colWidths=[2.2*cm, 3*cm, 3.2*cm, 5*cm, None])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.Color(0.2,0.2,0.2)),
+            ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("ALIGN",(1,1),(2,-1),"CENTER"),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
+        ]))
+        st.write("**Resumen de duplicados detectados**")
+        st.write(tbl)
+
+        criterio = st.radio("¿Cuál conservar en cada grupo?",
+                            ["Mantener el más reciente", "Mantener el más antiguo"], horizontal=True)
+
+        def limpiar(df_in: pd.DataFrame, dupes_df: pd.DataFrame, criterio_txt: str):
+            df_out = df_in.copy()
+            for _, r in dupes_df.iterrows():
+                idxs = r["indices"]
+                vivos = df_out.index.intersection(idxs)
+                if len(vivos) <= 1:
+                    continue
+                sub = df_out.loc[vivos]
+                if time_col in df_out.columns:
+                    ts = pd.to_datetime(sub[time_col], errors="coerce").dropna()
+                    if not ts.empty:
+                        keep = ts.idxmax() if criterio_txt.startswith("Mantener el más reciente") else ts.idxmin()
+                    else:
+                        keep = sub.index[0]
+                else:
+                    keep = sub.index[0]
+                drop_ids = [i for i in sub.index if i != keep]
+                df_out = df_out.drop(index=drop_ids, errors="ignore")
+            return df_out
+
+        cbtn1, cbtn2 = st.columns([1,1])
+        with cbtn1:
+            if st.button("🧹 Ejecutar limpieza ahora"):
+                st.session_state.df_clean = limpiar(st.session_state.df_clean, dupes, criterio)
+                st.success("Limpieza realizada. KPIs, mapa y tabla se han actualizado.")
+                st.rerun()
+        with cbtn2:
+            to_excel_download(df, filename="datos_limpios.xlsx", key="dl_excel_limpio")
+
+# ======== Mapa (duplicadas en ROJO) ========
 st.markdown("### 🗺️ Mapa (duplicadas en rojo)")
+
+# recomputar dup_set contra df actual (pos-limpieza)
+dupes_now = detect_duplicates(df, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
+dup_set = set()
+if not dupes_now.empty:
+    for lst in dupes_now["indices"]:
+        dup_set.update(lst)
 
 valid_points = df.dropna(subset=[lat_col, lon_col]).copy()
 for c in [lat_col, lon_col]:
@@ -305,7 +268,7 @@ folium.TileLayer(tiles="https://{s}.tile.stamen.com/terrain/{z}/{x}/{y}.png",
 folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                  attr="Tiles © Esri", name="Esri WorldImagery (satelital)").add_to(m)
 
-# Clúster + marcadores (rojo si es duplicado)
+# Marcadores
 if not valid_points.empty:
     mc = MarkerCluster(name="Clúster de puntos"); mc.add_to(m)
     for idx, r in valid_points.iterrows():
@@ -353,70 +316,108 @@ document.addEventListener('click', function(){ setTimeout(traducirPopupMedida, 1
 """
 m.get_root().html.add_child(Element(f"<script>{script_trad}</script>"))
 
-# Render del mapa
+# Render
 st_folium(m, use_container_width=True, returned_objects=[])
 
-# Descarga del mapa como HTML (siempre funciona)
+# Descargar mapa HTML para evidencias
 st.markdown("**Exportar mapa para evidencias**")
 map_html_bytes = m.get_root().render().encode("utf-8")
 st.download_button("⬇️ Descargar mapa (HTML)", data=map_html_bytes,
                    file_name="mapa_encuestas.html", mime="text/html", key="dl_html_mapa")
 
-# ============= Preparar detalle para PDF =============
+# ======== Armar contenido detallado para PDF ========
 detalle_dupes = []
-if not dupes.empty:
-    for _, row in dupes.iterrows():
+if not dupes_now.empty:
+    for _, row in dupes_now.iterrows():
         idxs = row["indices"]
-        motivo, rango, same_place = to_reason_string(df, idxs, time_col, lon_col, lat_col, window_minutes)
+        motivo, rango = reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes)
         detalle_dupes.append({
             "conteo": int(row["conteo_duplicados"]),
-            "eliminar": max(0, int(row["conteo_duplicados"]) - 1),
+            "eliminar": max(0, int(row["conteo_duplicados"])-1),
             "indices": idxs,
             "rango": rango,
             "motivo": motivo
         })
 
-# ============= Cargar evidencias para PDF (PNG o HTML -> PNG) =============
-def any_to_png_bytes(uploaded_file):
-    if uploaded_file is None: 
-        return None
-    name = uploaded_file.name.lower()
-    if name.endswith(".png"):
-        return uploaded_file.read()
-    if name.endswith(".html"):
-        html_b = uploaded_file.read()
-        st.info(f"Convirtiendo **{uploaded_file.name}** a PNG…")
-        png_b = html_to_png(html_b)
-        if png_b:
-            st.success("Conversión exitosa.")
-            return png_b
-        st.error("No fue posible convertir HTML a PNG en este entorno. Sube un PNG (captura).")
-        return None
-    st.error("Formato no soportado. Sube PNG o HTML.")
-    return None
+# ======== PDF con Platypus (textos se ajustan a los márgenes) ========
+def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png_bytes: bytes | None, mapa_final_png_bytes: bytes | None) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="H1b", parent=styles["Heading1"], fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="H2b", parent=styles["Heading2"], fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], leading=14))
+    styles.add(ParagraphStyle(name="Mono", parent=styles["BodyText"], fontName="Courier", fontSize=9, leading=12))
 
-map_dup_png = any_to_png_bytes(map_dup_any)
-map_final_png = any_to_png_bytes(map_final_any)
+    flow = []
+    flow.append(Paragraph("Informe de Avance – Encuestas", styles["H1b"]))
+    flow.append(Paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Body"]))
+    flow.append(Spacer(1, 10))
 
-# ============= PDF =============
+    # Resumen
+    flow.append(Paragraph("Resumen", styles["H2b"]))
+    bullets = "<br/>".join([f"- <b>{k}:</b> {v}" for k, v in conteos.items()])
+    flow.append(Paragraph(bullets, styles["Body"]))
+    flow.append(Spacer(1, 8))
+
+    # Caso: sin duplicados
+    if not detalle_dupes:
+        flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas las respuestas cargadas están validadas.", styles["Body"]))
+        flow.append(Spacer(1, 12))
+    else:
+        flow.append(Paragraph("Detalle de respuestas duplicadas", styles["H2b"]))
+        for i, d in enumerate(detalle_dupes, start=1):
+            flow.append(Paragraph(f"<b>Grupo {i}</b> – {d['conteo']} respuestas (se eliminarán {d['eliminar']}, quedará 1).", styles["Body"]))
+            flow.append(Paragraph(f"Rango temporal: {d['rango'] or '-'}", styles["Body"]))
+            # indices como texto monoespaciado envuelto
+            flow.append(Paragraph(f"Índices/IDs: {', '.join(map(str, d['indices']))}", styles["Mono"]))
+            flow.append(Paragraph(f"Motivo: {d['motivo']}", styles["Body"]))
+            flow.append(Spacer(1, 8))
+
+    # Evidencias
+    if mapa_dup_png_bytes or mapa_final_png_bytes:
+        flow.append(Paragraph("Evidencias visuales", styles["H2b"]))
+        def add_img(png_bytes, caption):
+            if not png_bytes: return
+            img = ImageReader(io.BytesIO(png_bytes))
+            iw, ih = img.getSize()
+            max_w = A4[0] - 4*cm
+            max_h = A4[1] / 2.2
+            ratio = min(max_w/iw, max_h/ih)
+            w, h = iw*ratio, ih*ratio
+            flow.append(Image(io.BytesIO(png_bytes), width=w, height=h))
+            flow.append(Paragraph(caption, styles["Body"]))
+            flow.append(Spacer(1, 8))
+        add_img(mapa_dup_png_bytes, "Mapa con duplicadas (marcadas en rojo).")
+        add_img(mapa_final_png_bytes, "Mapa final (respuestas validadas).")
+
+    doc.build(flow)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ======== Generar PDF ========
 st.markdown("### 📄 Generar PDF de avance")
-conteos = {
+conteos_pdf = {
     "Respuestas totales": total,
-    "Duplicadas detectadas": duplicadas,
-    "Se eliminarán (1 por grupo)": eliminar_por_grupo,
+    "Duplicadas detectadas": duplicadas if not dupes.empty else 0,
+    "Se eliminarán (1 por grupo)": eliminar_por_grupo if not dupes.empty else 0,
     "Quedarán validadas": validadas,
-    "Última respuesta": "-" if pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y")
+    "Última respuesta": "-" if time_col not in df.columns or pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y"),
 }
-pdf_bytes = build_pdf(conteos, detalle_dupes, map_dup_png, map_final_png)
+dup_png_bytes = map_dup_png.read() if map_dup_png else None
+final_png_bytes = map_final_png.read() if map_final_png else None
+pdf_bytes = build_pdf(conteos_pdf, detalle_dupes, dup_png_bytes, final_png_bytes)
 st.download_button(
     "⬇️ Descargar PDF de avance",
     data=pdf_bytes,
     file_name=f"informe_avance_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-    mime="application/pdf"
+    mime="application/pdf",
+    key="dl_pdf_avance"
 )
 
-# Tabla rápida
+# ======== Tabla rápida ========
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(df.head(1000), use_container_width=True)
-
 

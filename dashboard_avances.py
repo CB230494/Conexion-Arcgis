@@ -15,12 +15,18 @@ from folium import Element
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="Dashboard de Avances – Encuestas", layout="wide")
-st.title("📈 Dashboard de Avances – Encuestas")
+
+# ---- Título personalizable ----
+BASE_TITLE = "Informe de Avance – Encuestas"
+suffix = st.text_input("Añadir al título del informe (opcional)", placeholder="Ej.: Distrito Norte – Semana 40")
+REPORT_TITLE = BASE_TITLE if not suffix.strip() else f"{BASE_TITLE} – {suffix.strip()}"
+st.title(REPORT_TITLE)
 st.caption("Conteos grandes, limpieza de duplicados, mapa (duplicadas en rojo) y PDF con detalles y evidencias.")
 
 # ======== Utilidades ========
@@ -342,7 +348,7 @@ if not dupes_now.empty:
         })
 
 # ======== PDF con Platypus (ajuste de texto) ========
-def build_pdf(conteos: dict, detalle_dupes: list,
+def build_pdf(report_title: str, conteos: dict, detalle_dupes: list,
               mapa_dup_png_bytes: bytes | None,
               mapa_final_png_bytes: bytes | None) -> bytes:
     buffer = io.BytesIO()
@@ -355,20 +361,30 @@ def build_pdf(conteos: dict, detalle_dupes: list,
     styles.add(ParagraphStyle(name="H1b", parent=styles["Heading1"], fontName="Helvetica-Bold"))
     styles.add(ParagraphStyle(name="H2b", parent=styles["Heading2"], fontName="Helvetica-Bold"))
     styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], leading=14))
-    styles.add(ParagraphStyle(name="Mono", parent=styles["BodyText"], fontName="Courier", fontSize=9, leading=12))
 
     flow = []
-    flow.append(Paragraph("Informe de Avance – Encuestas", styles["H1b"]))
+    flow.append(Paragraph(report_title, styles["H1b"]))
     flow.append(Paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Body"]))
     flow.append(Spacer(1, 10))
 
-    # Resumen
+    # ---- Resumen en CUADRO ----
     flow.append(Paragraph("Resumen", styles["H2b"]))
-    bullets = "<br/>".join([f"- <b>{k}:</b> {v}" for k, v in conteos.items()])
-    flow.append(Paragraph(bullets, styles["Body"]))
-    flow.append(Spacer(1, 8))
+    rows = [[Paragraph(f"<b>{k}</b>", styles["Body"]), Paragraph(str(v), styles["Body"])] for k, v in conteos.items()]
+    table = Table(rows, colWidths=[7.5*cm, None])
+    table.setStyle(TableStyle([
+        ("BOX", (0,0), (-1,-1), 0.8, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("BACKGROUND", (0,0), (-1,-1), colors.whitesmoke),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    flow.append(table)
+    flow.append(Spacer(1, 10))
 
-    # Detalle duplicados
+    # ---- Detalle duplicados (IDs con misma fuente que el cuerpo) ----
     if not detalle_dupes:
         flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas las respuestas cargadas están validadas.", styles["Body"]))
         flow.append(Spacer(1, 12))
@@ -380,11 +396,12 @@ def build_pdf(conteos: dict, detalle_dupes: list,
                 styles["Body"]
             ))
             flow.append(Paragraph(f"Rango temporal: {d['rango'] or '-'}", styles["Body"]))
-            flow.append(Paragraph(f"Índices/IDs: {', '.join(map(str, d['indices']))}", styles["Mono"]))
+            # IDs en estilo Body (no monoespaciado)
+            flow.append(Paragraph(f"Índices/IDs: {', '.join(map(str, d['indices']))}", styles["Body"]))
             flow.append(Paragraph(f"Motivo: {d['motivo']}", styles["Body"]))
             flow.append(Spacer(1, 8))
 
-    # Evidencias
+    # ---- Evidencias ----
     if (mapa_dup_png_bytes is not None) or (mapa_final_png_bytes is not None):
         flow.append(Paragraph("Evidencias visuales", styles["H2b"]))
 
@@ -419,7 +436,7 @@ conteos_pdf = {
 }
 dup_png_bytes = map_dup_png.read() if map_dup_png else None
 final_png_bytes = map_final_png.read() if map_final_png else None
-pdf_bytes = build_pdf(conteos_pdf, detalle_dupes, dup_png_bytes, final_png_bytes)
+pdf_bytes = build_pdf(REPORT_TITLE, conteos_pdf, detalle_dupes, dup_png_bytes, final_png_bytes)
 st.download_button(
     "⬇️ Descargar PDF de avance",
     data=pdf_bytes,

@@ -21,45 +21,30 @@ from reportlab.lib.utils import ImageReader
 # ===================== CONFIG =====================
 st.set_page_config(page_title="Dashboard de Avances – Encuestas", layout="wide")
 st.title("📈 Dashboard de Avances – Encuestas")
-st.caption("Conteos grandes, mapa, descarga de PNG y PDF de avance.")
+st.caption("Conteos grandes, mapa, descarga de HTML y PDF de avance. (PNG opcional)")
 
 # ======== Utilidades ========
 META_COLS = {"ObjectID", "GlobalID", "instance_id", "CreationDate", "EditDate", "Creator", "Editor"}
 
 def normalize_string(x) -> str:
-    """Normaliza un valor escalar a string limpio en minúscula (maneja NaN)."""
-    if pd.isna(x):
-        return ""
+    if pd.isna(x): return ""
     s = str(x).strip().lower()
     return " ".join(s.split())
 
 def normalize_factors(x) -> str:
-    """
-    Normaliza un valor escalar de factores tipo 'a, b; c' a 'a,b,c' ordenado.
-    (Se usa con .apply sobre la Serie)
-    """
-    if pd.isna(x):
-        return ""
+    if pd.isna(x): return ""
     parts = str(x).replace(";", ",").split(",")
     parts = [normalize_string(p) for p in parts if normalize_string(p)]
     parts.sort()
     return ",".join(parts)
 
 def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list):
-    """Grupos de duplicados exactos (mismo contenido normalizado) en ventana corta."""
-    if df.empty or not content_cols:
-        return pd.DataFrame()
+    if df.empty or not content_cols: return pd.DataFrame()
     tmp = df.copy()
-
-    # normalizar contenido (APLICANDO función por elemento)
     normalized = {}
     for c in content_cols:
-        if "factor" in c.lower():
-            normalized[c] = tmp[c].apply(normalize_factors)
-        else:
-            normalized[c] = tmp[c].apply(normalize_string)
+        normalized[c] = tmp[c].apply(normalize_factors) if "factor" in c.lower() else tmp[c].apply(normalize_string)
     norm_df = pd.DataFrame(normalized)
-
     key = pd.util.hash_pandas_object(norm_df, index=False)
     tmp["_hash_content"] = key
     tmp[time_col] = pd.to_datetime(tmp[time_col], errors="coerce")
@@ -70,8 +55,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
     results = []
     for h, g in tmp.groupby("_hash_content", dropna=False):
         g = g.copy().sort_values(time_col)
-        if len(g) < 2:
-            continue
+        if len(g) < 2: continue
         g["time_diff_prev"] = g[time_col].diff()
         block_id = (g["time_diff_prev"].isna() | (g["time_diff_prev"] > win)).cumsum()
         for _, gb in g.groupby(block_id):
@@ -103,35 +87,21 @@ def big_number(label: str, value: str):
     )
 
 def build_pdf(conteos: dict, mapa_png_bytes: bytes | None) -> bytes:
-    """Genera PDF en memoria con conteos y (opcional) imagen del mapa."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     W, H = A4
-
-    # Encabezado
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(2*cm, H-2*cm, "Informe de Avance – Encuestas")
-    c.setFont("Helvetica", 10)
-    c.drawString(2*cm, H-2.6*cm, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-
-    # Conteos
+    c.setFont("Helvetica-Bold", 16); c.drawString(2*cm, H-2*cm, "Informe de Avance – Encuestas")
+    c.setFont("Helvetica", 10); c.drawString(2*cm, H-2.6*cm, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     y = H - 4.0*cm
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(2*cm, y, "Resumen")
-    y -= 0.8*cm
+    c.setFont("Helvetica-Bold", 13); c.drawString(2*cm, y, "Resumen"); y -= 0.8*cm
     c.setFont("Helvetica", 11)
     for k, v in conteos.items():
-        c.drawString(2*cm, y, f"- {k}: {v}")
-        y -= 0.6*cm
-
-    # Imagen del mapa (si hay)
+        c.drawString(2*cm, y, f"- {k}: {v}"); y -= 0.6*cm
     if mapa_png_bytes:
         try:
             img = ImageReader(io.BytesIO(mapa_png_bytes))
-            max_w = W - 4*cm
-            max_h = H/2.0
-            iw, ih = img.getSize()
-            ratio = min(max_w/iw, max_h/ih)
+            max_w = W - 4*cm; max_h = H/2.0
+            iw, ih = img.getSize(); ratio = min(max_w/iw, max_h/ih)
             w, h = iw*ratio, ih*ratio
             c.drawImage(img, (W - w)/2, 3*cm, width=w, height=h, preserveAspectRatio=True, anchor='c')
             c.setFont("Helvetica-Oblique", 9)
@@ -139,26 +109,27 @@ def build_pdf(conteos: dict, mapa_png_bytes: bytes | None) -> bytes:
         except Exception:
             c.setFont("Helvetica-Oblique", 9)
             c.drawString(2*cm, 3*cm, "Nota: no se pudo incrustar la imagen del mapa.")
-
-    c.showPage()
-    c.save()
-    buffer.seek(0)
+    c.showPage(); c.save(); buffer.seek(0)
     return buffer.getvalue()
 
-# ======== Sidebar mínimo ========
+def map_to_html_download(m: folium.Map, filename: str = "mapa.html", key: str = "dl_html"):
+    """Descarga el mapa como HTML (siempre funciona, sin JS externos)."""
+    html = m.get_root().render().encode("utf-8")
+    st.download_button("⬇️ Descargar mapa (HTML)", data=html, file_name=filename,
+                       mime="text/html", key=key)
+
+# ======== Sidebar ========
 st.sidebar.header("Cargar Excel")
 uploaded = st.sidebar.file_uploader("Sube un archivo .xlsx", type=["xlsx"])
-
-# (Opcional) subir PNG capturado del mapa para incrustarlo en el PDF
 st.sidebar.markdown("---")
+enable_png_button = st.sidebar.checkbox("Intentar botón PNG dentro del mapa (puede fallar por CSP)", value=False)
 map_png = st.sidebar.file_uploader("Opcional: sube el PNG del mapa (para el PDF)", type=["png"])
 
 # ======== Carga de datos ========
 @st.cache_data(show_spinner=False)
 def load_excel_first_sheet(file_like):
     if hasattr(file_like, "read"):
-        data = file_like.read()
-        bio = io.BytesIO(data)
+        data = file_like.read(); bio = io.BytesIO(data)
     else:
         bio = file_like
     xls = pd.ExcelFile(bio, engine="openpyxl")
@@ -166,21 +137,19 @@ def load_excel_first_sheet(file_like):
     return pd.read_excel(xls, sheet_name=first_sheet), first_sheet
 
 if not uploaded:
-    st.info("Sube un Excel (.xlsx) en la barra lateral para comenzar.")
-    st.stop()
+    st.info("Sube un Excel (.xlsx) en la barra lateral para comenzar."); st.stop()
 
 df, sheet_name = load_excel_first_sheet(uploaded)
 
 # Fechas & columnas clave
 for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
-    if c in df.columns:
-        df[c] = pd.to_datetime(df[c], errors="coerce")
+    if c in df.columns: df[c] = pd.to_datetime(df[c], errors="coerce")
 
 lon_col, lat_col = "x", "y"
 time_col = "CreationDate" if "CreationDate" in df.columns else ("EditDate" if "EditDate" in df.columns else "¿Cuándo fue el último incidente?")
 window_minutes = 10
 
-# Duplicados exactos (¡arreglo aplicado!)
+# Duplicados
 content_cols = [c for c in df.columns if c not in META_COLS | {lon_col, lat_col}]
 dupes = detect_duplicates(df, time_col=time_col, window_minutes=window_minutes, content_cols=content_cols)
 
@@ -189,7 +158,7 @@ total = len(df)
 duplicadas = int(dupes["conteo_duplicados"].sum()) if not dupes.empty else 0
 eliminadas_si_limpio = int(sum(max(0, n-1) for n in dupes["conteo_duplicados"])) if not dupes.empty else 0
 
-# Métricas grandes
+# Métricas
 c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1])
 with c1: big_number("Respuestas totales", f"{total}")
 with c2: big_number("Duplicadas detectadas", f"{duplicadas}")
@@ -200,7 +169,7 @@ with c4:
     big_number("Última respuesta", fecha_txt)
 
 # ============= MAPA =============
-st.markdown("### 🗺️ Mapa (con descarga PNG)")
+st.markdown("### 🗺️ Mapa")
 
 valid_points = df.dropna(subset=[lat_col, lon_col]).copy()
 for c in [lat_col, lon_col]:
@@ -250,7 +219,7 @@ MeasureControl(position='topright', primary_length_unit='meters',
                primary_area_unit='sqmeters',
                secondary_area_unit='hectares').add_to(m)
 
-# Traducción popup medición
+# Traducir popup medición
 script_trad = """
 function traducirPopupMedida(){
   document.querySelectorAll('.leaflet-popup-content').forEach(function(el){
@@ -266,35 +235,41 @@ document.addEventListener('click', function(){ setTimeout(traducirPopupMedida, 1
 """
 m.get_root().html.add_child(Element(f"<script>{script_trad}</script>"))
 
-# ===== Botón para descargar PNG dentro del mapa (leaflet-easyPrint) =====
-class EasyPrint(MacroElement):
-    _template = Template(u"""
-        {% macro script(this, kwargs) %}
-            L.easyPrint({
-              title: 'Descargar PNG',
-              position: 'topleft',
-              sizeModes: ['Current'],
-              exportOnly: true,
-              filename: 'mapa_encuestas'
-            }).addTo({{this._parent.get_name()}});
-        {% endmacro %}
-    """)
-    def render(self, **kwargs):
-        super().render(**kwargs)
-
-# Cargar el plugin desde CDN
-cdn = """
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.easyprint/2.1.9/bundle.min.js"
-        integrity="sha512-8c4Yk9b2oM1vGm7lC1b2f1H7zj5XvY3oFq9n0gN8gq1Wq+8VRbGx9bO5o5nDNxNUGf0Qp3qz3b3yQj6mvx8XgA=="
-        crossorigin="anonymous"></script>
-"""
-m.get_root().html.add_child(Element(cdn))
-m.add_child(EasyPrint())
-
-# Render Folium
+# Render del mapa (sin JS externos, estable)
 st_folium(m, use_container_width=True, returned_objects=[])
 
-st.info("Usa el botón **Descargar PNG** sobre el mapa. Luego súbelo en la barra lateral para incluirlo en el PDF.")
+# Descarga del mapa como HTML (siempre funciona)
+map_to_html_download(m, filename="mapa_encuestas.html", key="dl_html_mapa")
+
+# (Opcional) intentar botón PNG si el hosting lo permite
+if enable_png_button:
+    class EasyPrint(MacroElement):
+        _template = Template(u"""
+            {% macro script(this, kwargs) %}
+                L.easyPrint({
+                  title: 'Descargar PNG',
+                  position: 'topleft',
+                  sizeModes: ['Current'],
+                  exportOnly: true,
+                  filename: 'mapa_encuestas'
+                }).addTo({{this._parent.get_name()}});
+            {% endmacro %}
+        """)
+        def render(self, **kwargs):
+            super().render(**kwargs)
+
+    cdn = """
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.easyprint/2.1.9/bundle.min.js"></script>
+    """
+    m2 = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
+    # Repetimos las capas y capas de datos (rápido)
+    for l in m._children.copy().values():
+        m2.add_child(l)
+    m2.get_root().html.add_child(Element(cdn))
+    m2.add_child(EasyPrint())
+    st.markdown("#### 🖼️ Mapa (con intento de botón PNG)")
+    st_folium(m2, use_container_width=True, returned_objects=[])
+    st.info("Si no ves el mapa o el botón, tu hosting bloquea scripts externos (CSP). Usa la descarga HTML o sube un PNG manual.")
 
 # ============= PDF =============
 st.markdown("### 📄 Generar PDF de avance")
@@ -316,5 +291,6 @@ st.download_button(
 # Tabla rápida
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(df.head(1000), use_container_width=True)
+
 
 

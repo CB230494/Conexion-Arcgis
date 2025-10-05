@@ -126,9 +126,11 @@ def reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes):
 # ======== Sidebar ========
 st.sidebar.header("Cargar Excel")
 uploaded = st.sidebar.file_uploader("Sube un archivo .xlsx", type=["xlsx"])
+
 st.sidebar.markdown("---")
-st.sidebar.subheader("Evidencias para PDF (puedes subir varias PNG)")
-evidence_png_files = st.sidebar.file_uploader("Sube 1 o más imágenes (PNG)", type=["png"], accept_multiple_files=True)
+st.sidebar.subheader("Evidencias para PDF")
+map_dup_png = st.sidebar.file_uploader("🟥 Mapa con duplicadas (PNG)", type=["png"])
+map_final_png = st.sidebar.file_uploader("✅ Mapa final validado (PNG)", type=["png"])
 
 # ======== Cargar datos ========
 @st.cache_data(show_spinner=False)
@@ -172,8 +174,8 @@ ultima_fecha = "-" if time_col not in df.columns or pd.isna(df[time_col].max()) 
 c1, c2, c3, c4 = st.columns(4)
 with c1: big_number("Respuestas totales", total)
 with c2: big_number("Duplicadas detectadas", duplicadas)
-with c3: big_number("Se eliminarán", eliminar_por_grupo)
-with c4: big_number("Validadas", validadas)
+with c3: big_number("Se eliminarán (1 por grupo)", eliminar_por_grupo)
+with c4: big_number("Quedarán validadas", validadas)
 
 # ---- Cuadro resumen en la app ----
 st.markdown(
@@ -184,7 +186,7 @@ st.markdown(
       <div style="font-size:15px;line-height:1.6;">
         <b>Respuestas totales:</b> {total}<br>
         <b>Duplicadas detectadas:</b> {duplicadas}<br>
-        <b>Se eliminarán:</b> {eliminar_por_grupo}<br>
+        <b>Se eliminarán (1 por grupo):</b> {eliminar_por_grupo}<br>
         <b>Quedarán validadas:</b> {validadas}<br>
         <b>Última respuesta:</b> {ultima_fecha}
       </div>
@@ -345,19 +347,19 @@ st.download_button("⬇️ Descargar mapa (HTML)", data=map_html_bytes,
                    file_name="mapa_encuestas.html", mime="text/html", key="dl_html_mapa")
 
 # ======== Preparar detalle para PDF ========
-detalle_dupes = []
+detalle_dupes_list = []
 if not dupes_now.empty:
     for _, row in dupes_now.iterrows():
         motivo, rango = reason_for_group(df, row["indices"], time_col, lon_col, lat_col, window_minutes)
-        detalle_dupes.append({
+        detalle_dupes_list.append({
             "conteo": int(row["conteo_duplicados"]),
             "eliminar": max(0, int(row["conteo_duplicados"]) - 1),
             "rango": rango,
             "motivo": motivo
         })
 
-# ======== PDF (cuadro resumen + evidencias paginadas) ========
-def build_pdf(title, conteos, detalle_dupes, evidencias):
+# ======== PDF (cuadro resumen + evidencias: duplicadas y final en páginas separadas) ========
+def build_pdf(title, conteos, detalle_dupes, dup_png_bytes, final_png_bytes):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
@@ -398,39 +400,30 @@ def build_pdf(title, conteos, detalle_dupes, evidencias):
     else:
         flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas están validadas.", styles["Body"]))
 
-    # Evidencias paginadas: primera en página nueva, luego 1 o 2 por página según alto
-    if evidencias:
+    # Evidencias (cada imagen en su propia página; la sección inicia en nueva página)
+    if dup_png_bytes or final_png_bytes:
         flow.append(PageBreak())
         flow.append(Paragraph("Evidencias visuales", styles["Heading2"]))
         flow.append(Spacer(1, 6))
 
         max_w = A4[0] - 4*cm
-        max_h = A4[1] / 2.4
-        two_threshold = 8*cm
+        max_h = A4[1] / 2.0  # más contenido respirando
 
-        def scaled_img(b):
-            imgR = ImageReader(io.BytesIO(b))
+        def add_scaled_img(png_bytes, caption):
+            imgR = ImageReader(io.BytesIO(png_bytes))
             iw, ih = imgR.getSize()
             ratio = min(max_w/iw, max_h/ih)
             w, h = iw*ratio, ih*ratio
-            return Image(io.BytesIO(b), width=w, height=h), w, h
+            flow.append(Image(io.BytesIO(png_bytes), width=w, height=h))
+            flow.append(Spacer(1, 6))
+            flow.append(Paragraph(caption, styles["Body"]))
 
-        # Primera imagen
-        img0, _, _ = scaled_img(evidencias[0])
-        flow.append(img0)
-        flow.append(Spacer(1, 6))
+        if dup_png_bytes:
+            add_scaled_img(dup_png_bytes, "Mapa con duplicadas (marcadas en rojo).")
 
-        i = 1
-        while i < len(evidencias):
-            img1, _, h1 = scaled_img(evidencias[i])
-            if i+1 < len(evidencias):
-                img2, _, h2 = scaled_img(evidencias[i+1])
-                if h1 <= two_threshold and h2 <= two_threshold:
-                    flow.append(img1); flow.append(Spacer(1, 6))
-                    flow.append(img2); flow.append(PageBreak())
-                    i += 2
-                    continue
-            flow.append(img1); flow.append(PageBreak()); i += 1
+        if final_png_bytes:
+            flow.append(PageBreak())
+            add_scaled_img(final_png_bytes, "Mapa final (respuestas validadas).")
 
     doc.build(flow)
     buffer.seek(0)
@@ -444,8 +437,9 @@ conteos = {
     "Quedarán validadas": validadas,
     "Última respuesta": ultima_fecha
 }
-evidences_bytes = [f.read() for f in evidence_png_files] if evidence_png_files else []
-pdf_bytes = build_pdf(REPORT_TITLE, conteos, detalle_dupes, evidences_bytes)
+dup_png_bytes = map_dup_png.read() if map_dup_png else None
+final_png_bytes = map_final_png.read() if map_final_png else None
+pdf_bytes = build_pdf(REPORT_TITLE, conteos, detalle_dupes_list, dup_png_bytes, final_png_bytes)
 
 st.download_button(
     "⬇️ Descargar PDF de avance",
@@ -457,3 +451,4 @@ st.download_button(
 # Tabla
 st.markdown("### 📋 Vista previa de datos")
 st.dataframe(df.head(1000), use_container_width=True)
+

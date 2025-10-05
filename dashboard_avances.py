@@ -22,14 +22,14 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 # ===================== CONFIG =====================
-st.set_page_config(page_title="Dashboard de Avances – Encuestas", layout="wide")
+st.set_page_config(page_title="Dashboard de Avance – Encuestas", layout="wide")
 
-# ---- Título personalizable ----
+# ---- Título personalizable (también para el PDF) ----
 BASE_TITLE = "Informe de Avance – Encuestas"
 suffix = st.text_input("Añadir al título del informe (opcional)", placeholder="Ej.: Distrito Norte – Semana 40")
 REPORT_TITLE = BASE_TITLE if not suffix.strip() else f"{BASE_TITLE} – {suffix.strip()}"
 st.title(REPORT_TITLE)
-st.caption("Dashboard con conteos, limpieza de duplicados, mapa y generación de PDF con evidencias.")
+st.caption("Dashboard con conteos, limpieza de duplicados, mapa (duplicadas en rojo) y PDF con evidencias.")
 
 # ======== Funciones base ========
 META_COLS = {"ObjectID", "GlobalID", "instance_id", "CreationDate", "EditDate", "Creator", "Editor"}
@@ -83,7 +83,7 @@ def detect_duplicates(df, time_col: str, window_minutes: int, content_cols: list
 
 def center_from_points(df, lon_col, lat_col):
     if df.empty: return (10.0, -84.0)
-    return (df[lat_col].mean(), df[lon_col].mean())
+    return (float(df[lat_col].mean()), float(df[lon_col].mean()))
 
 def big_number(label: str, value: str):
     st.markdown(
@@ -156,7 +156,7 @@ for c in ["CreationDate", "EditDate", "¿Cuándo fue el último incidente?"]:
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
 lon_col, lat_col = "x", "y"
-time_col = "CreationDate" if "CreationDate" in df.columns else "EditDate"
+time_col = "CreationDate" if "CreationDate" in df.columns else ("EditDate" if "EditDate" in df.columns else "¿Cuándo fue el último incidente?")
 window_minutes = 10
 
 content_cols = [c for c in df.columns if c not in META_COLS | {lon_col, lat_col}]
@@ -165,9 +165,9 @@ dupes = detect_duplicates(df, time_col, window_minutes, content_cols)
 # ---- KPIs ----
 total = len(df)
 duplicadas = int(dupes["conteo_duplicados"].sum()) if not dupes.empty else 0
-eliminar_por_grupo = int(sum(max(0, n-1) for n in dupes["conteo_duplicados"])) if not dupes.empty else 0
+eliminar_por_grupo = int(sum(max(0, n-1) for n in (dupes["conteo_duplicados"] if not dupes.empty else [])))
 validadas = total - eliminar_por_grupo
-ultima_fecha = df[time_col].max().strftime("%d/%m/%Y") if time_col in df.columns else "-"
+ultima_fecha = "-" if time_col not in df.columns or pd.isna(df[time_col].max()) else pd.to_datetime(df[time_col].max()).strftime("%d/%m/%Y")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: big_number("Respuestas totales", total)
@@ -175,7 +175,7 @@ with c2: big_number("Duplicadas detectadas", duplicadas)
 with c3: big_number("Se eliminarán", eliminar_por_grupo)
 with c4: big_number("Validadas", validadas)
 
-# ---- Cuadro resumen ----
+# ---- Cuadro resumen en la app ----
 st.markdown(
     f"""
     <div style="border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);
@@ -192,35 +192,56 @@ st.markdown(
     """, unsafe_allow_html=True
 )
 
+st.info(
+    f"Un **duplicado** es un grupo de respuestas con **exactamente la misma información** "
+    f"registradas en un lapso **≤ {window_minutes} minutos**. En la limpieza, de cada grupo se "
+    f"**mantiene 1** y se **eliminan** las demás; por eso, de {total} pasarían a **{validadas}** respuestas validadas."
+)
+
 # ======== LIMPIEZA ========
 if dupes.empty:
     st.success("✅ No se detectaron duplicados.")
 else:
     with st.expander("🧹 Limpiar duplicados (mantener 1 por grupo)"):
         filas = []
+        explicaciones = []
         for i, row in dupes.iterrows():
             idxs = row["indices"]
             motivo, rango = reason_for_group(df, idxs, time_col, lon_col, lat_col, window_minutes)
             filas.append({
                 "Grupo": f"Grupo {i+1}",
-                "Respuestas": row["conteo_duplicados"],
-                "Se eliminarán": max(0, row["conteo_duplicados"]-1),
-                "Rango": rango, "Motivo": motivo
+                "Respuestas": int(row["conteo_duplicados"]),
+                "Se eliminarán": max(0, int(row["conteo_duplicados"]) - 1),
+                "Rango": rango or "-",
+                "Motivo": motivo
             })
+            explicaciones.append(
+                f"**Grupo {i+1}**: {int(row['conteo_duplicados'])} respuestas → "
+                f"se eliminarán {max(0, int(row['conteo_duplicados'])-1)} y **se conservará 1**. "
+                f"Rango: {rango or '-'} · Motivo: {motivo}"
+            )
         st.dataframe(pd.DataFrame(filas), use_container_width=True)
+        st.markdown("—")
+        for txt in explicaciones:
+            st.markdown(f"- {txt}")
+
         criterio = st.radio("¿Cuál conservar?", ["Más reciente", "Más antiguo"], horizontal=True)
 
-        def limpiar(df_in, dupes_df, criterio):
+        def limpiar(df_in, dupes_df, criterio_txt):
             df_out = df_in.copy()
             for _, r in dupes_df.iterrows():
                 idxs = r["indices"]
                 vivos = df_out.index.intersection(idxs)
-                if len(vivos) <= 1: continue
+                if len(vivos) <= 1: 
+                    continue
                 sub = df_out.loc[vivos]
                 ts = pd.to_datetime(sub[time_col], errors="coerce").dropna()
-                keep = ts.idxmax() if criterio == "Más reciente" else ts.idxmin()
-                drop = [i for i in sub.index if i != keep]
-                df_out = df_out.drop(index=drop)
+                if not ts.empty:
+                    keep = ts.idxmax() if criterio_txt.startswith("Más reciente") else ts.idxmin()
+                else:
+                    keep = sub.index[0]
+                drop_ids = [i for i in sub.index if i != keep]
+                df_out = df_out.drop(index=drop_ids)
             return df_out
 
         if st.button("🧹 Ejecutar limpieza ahora"):
@@ -228,10 +249,12 @@ else:
             st.success("Limpieza realizada correctamente.")
             st.rerun()
 
+        to_excel_download(df, filename="datos_limpios.xlsx", key="dl_excel_limpio")
+
 # ======== MAPA ========
 st.markdown("### 🗺️ Mapa (duplicadas en rojo)")
 
-# puntos válidos
+# Puntos válidos (corrección de dropna/columnas)
 valid_points = df.copy()
 for c in [lat_col, lon_col]:
     if c in valid_points.columns:
@@ -243,100 +266,184 @@ dup_set = {i for lst in dupes_now["indices"] for i in lst} if not dupes_now.empt
 
 center_lat, center_lon = center_from_points(valid_points, lon_col, lat_col)
 m = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
-folium.TileLayer("OpenStreetMap").add_to(m)
-folium.TileLayer("Stamen Terrain").add_to(m)
-folium.TileLayer("CartoDB Positron").add_to(m)
-folium.TileLayer("Esri WorldImagery").add_to(m)
 
+# Capas base (todas con attribution correcto)
+folium.TileLayer(
+    tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    name="OpenStreetMap",
+    attr="© OpenStreetMap contributors"
+).add_to(m)
+
+folium.TileLayer(
+    tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    name="CartoDB Positron (gris)",
+    attr="© OpenStreetMap contributors © CARTO"
+).add_to(m)
+
+folium.TileLayer(
+    tiles="https://stamen-tiles.a.ssl.fastly.net/terrain/{z}/{x}/{y}.png",
+    name="Stamen Terrain (relieve)",
+    attr="Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap"
+).add_to(m)
+
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    name="Esri WorldImagery (satelital)",
+    attr="Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
+).add_to(m)
+
+# Marcadores
 if not valid_points.empty:
-    mc = MarkerCluster().add_to(m)
+    mc = MarkerCluster(name="Clúster de puntos").add_to(m)
     for idx, r in valid_points.iterrows():
         color = "red" if idx in dup_set else "blue"
-        folium.Marker([r[lat_col], r[lon_col]],
-                      icon=folium.Icon(color=color),
-                      popup=f"ID {idx}").add_to(mc)
+        popup_items = []
+        for c in df.columns:
+            val = r[c]
+            if pd.isna(val): 
+                continue
+            if isinstance(val, (pd.Timestamp, np.datetime64)):
+                try: val = pd.to_datetime(val).strftime("%d/%m/%Y %H:%M")
+                except: pass
+            popup_items.append(f"<b>{c}:</b> {val}")
+        folium.Marker(
+            [r[lat_col], r[lon_col]],
+            icon=folium.Icon(color=color, icon="info-sign"),
+            popup=folium.Popup("<br>".join(popup_items), max_width=420)
+        ).add_to(mc)
     if len(valid_points) > 1:
-        HeatMap(valid_points[[lat_col, lon_col]].values.tolist(),
-                name="Mapa de calor").add_to(m)
+        HeatMap(valid_points[[lat_col, lon_col]].values.tolist(), name="Mapa de calor",
+                radius=20, blur=25,
+                gradient={0.2:"#ffffb2",0.4:"#fecc5c",0.6:"#fd8d3c",0.8:"#f03b20",1.0:"#bd0026"}).add_to(m)
 
-folium.LayerControl().add_to(m)
-MeasureControl(primary_length_unit="meters", secondary_length_unit="kilometers").add_to(m)
+folium.LayerControl(collapsed=False).add_to(m)
+MeasureControl(position="topright", primary_length_unit="meters",
+               secondary_length_unit="kilometers",
+               primary_area_unit="sqmeters", secondary_area_unit="hectares").add_to(m)
+
+# Traducir popup de medición
+script_trad = """
+function traducirPopupMedida(){
+  document.querySelectorAll('.leaflet-popup-content').forEach(function(el){
+    el.innerHTML = el.innerHTML
+      .replace(/Linear measurement/gi, 'Medición lineal')
+      .replace(/Meters/gi, 'Metros')
+      .replace(/Miles/gi, 'Millas')
+      .replace(/Center on this line/gi, 'Centrar en esta línea')
+      .replace(/Delete/gi, 'Eliminar');
+  });
+}
+document.addEventListener('click', function(){ setTimeout(traducirPopupMedida, 120); });
+"""
+m.get_root().html.add_child(Element(f"<script>{script_trad}</script>"))
 st_folium(m, use_container_width=True, returned_objects=[])
 
-# ======== PDF ========
+# Exportar mapa HTML
+st.markdown("**Exportar mapa para evidencias**")
+map_html_bytes = m.get_root().render().encode("utf-8")
+st.download_button("⬇️ Descargar mapa (HTML)", data=map_html_bytes,
+                   file_name="mapa_encuestas.html", mime="text/html", key="dl_html_mapa")
+
+# ======== Preparar detalle para PDF ========
+detalle_dupes = []
+if not dupes_now.empty:
+    for _, row in dupes_now.iterrows():
+        motivo, rango = reason_for_group(df, row["indices"], time_col, lon_col, lat_col, window_minutes)
+        detalle_dupes.append({
+            "conteo": int(row["conteo_duplicados"]),
+            "eliminar": max(0, int(row["conteo_duplicados"]) - 1),
+            "rango": rango,
+            "motivo": motivo
+        })
+
+# ======== PDF (cuadro resumen + evidencias paginadas) ========
 def build_pdf(title, conteos, detalle_dupes, evidencias):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], leading=14))
+
     flow = []
     flow.append(Paragraph(title, styles["Heading1"]))
     flow.append(Paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Body"]))
     flow.append(Spacer(1, 10))
 
-    # --- Cuadro resumen ---
+    # Cuadro resumen
     rows = [[Paragraph(f"<b>{k}</b>", styles["Body"]), Paragraph(str(v), styles["Body"])] for k, v in conteos.items()]
-    table = Table(rows, colWidths=[7*cm, None])
+    table = Table(rows, colWidths=[7.5*cm, None])
     table.setStyle(TableStyle([
         ("BOX", (0,0), (-1,-1), 0.8, colors.black),
-        ("BACKGROUND", (0,0), (-1,-1), colors.whitesmoke)
+        ("INNERGRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("BACKGROUND", (0,0), (-1,-1), colors.whitesmoke),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
     ]))
     flow.append(Paragraph("Resumen", styles["Heading2"]))
     flow.append(table)
     flow.append(Spacer(1, 12))
 
-    # --- Detalle duplicados ---
+    # Detalle duplicados
     if detalle_dupes:
         flow.append(Paragraph("Detalle de respuestas duplicadas", styles["Heading2"]))
         for i, d in enumerate(detalle_dupes, 1):
-            flow.append(Paragraph(f"<b>Grupo {i}</b>: {d['conteo']} respuestas, "
-                                  f"se eliminarán {d['eliminar']} y quedará 1.", styles["Body"]))
-            flow.append(Paragraph(f"Rango: {d['rango']}", styles["Body"]))
+            flow.append(Paragraph(f"<b>Grupo {i}</b>: {d['conteo']} respuestas "
+                                  f"(se eliminarán {d['eliminar']}, quedará 1).", styles["Body"]))
+            flow.append(Paragraph(f"Rango temporal: {d['rango'] or '-'}", styles["Body"]))
             flow.append(Paragraph(f"Motivo: {d['motivo']}", styles["Body"]))
             flow.append(Spacer(1, 6))
     else:
-        flow.append(Paragraph("No se detectaron duplicados.", styles["Body"]))
+        flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas están validadas.", styles["Body"]))
 
-    # --- Evidencias ---
+    # Evidencias paginadas: primera en página nueva, luego 1 o 2 por página según alto
     if evidencias:
         flow.append(PageBreak())
         flow.append(Paragraph("Evidencias visuales", styles["Heading2"]))
+        flow.append(Spacer(1, 6))
+
         max_w = A4[0] - 4*cm
-        max_h = A4[1]/2.4
-        for i, ev in enumerate(evidencias):
-            img = ImageReader(io.BytesIO(ev))
-            iw, ih = img.getSize()
+        max_h = A4[1] / 2.4
+        two_threshold = 8*cm
+
+        def scaled_img(b):
+            imgR = ImageReader(io.BytesIO(b))
+            iw, ih = imgR.getSize()
             ratio = min(max_w/iw, max_h/ih)
             w, h = iw*ratio, ih*ratio
-            flow.append(Image(io.BytesIO(ev), width=w, height=h))
-            flow.append(Spacer(1, 8))
-            if (i+1) % 2 == 0:
-                flow.append(PageBreak())
+            return Image(io.BytesIO(b), width=w, height=h), w, h
+
+        # Primera imagen
+        img0, _, _ = scaled_img(evidencias[0])
+        flow.append(img0)
+        flow.append(Spacer(1, 6))
+
+        i = 1
+        while i < len(evidencias):
+            img1, _, h1 = scaled_img(evidencias[i])
+            if i+1 < len(evidencias):
+                img2, _, h2 = scaled_img(evidencias[i+1])
+                if h1 <= two_threshold and h2 <= two_threshold:
+                    flow.append(img1); flow.append(Spacer(1, 6))
+                    flow.append(img2); flow.append(PageBreak())
+                    i += 2
+                    continue
+            flow.append(img1); flow.append(PageBreak()); i += 1
 
     doc.build(flow)
     buffer.seek(0)
     return buffer.getvalue()
 
-# --- Construir PDF ---
+# --- Construir PDF y botón de descarga ---
 conteos = {
     "Respuestas totales": total,
     "Duplicadas detectadas": duplicadas,
-    "Se eliminarán": eliminar_por_grupo,
+    "Se eliminarán (1 por grupo)": eliminar_por_grupo,
     "Quedarán validadas": validadas,
     "Última respuesta": ultima_fecha
 }
-detalle_dupes = []
-if not dupes_now.empty:
-    for i, row in dupes_now.iterrows():
-        motivo, rango = reason_for_group(df, row["indices"], time_col, lon_col, lat_col, window_minutes)
-        detalle_dupes.append({
-            "conteo": row["conteo_duplicados"],
-            "eliminar": max(0, row["conteo_duplicados"]-1),
-            "rango": rango,
-            "motivo": motivo
-        })
-
 evidences_bytes = [f.read() for f in evidence_png_files] if evidence_png_files else []
 pdf_bytes = build_pdf(REPORT_TITLE, conteos, detalle_dupes, evidences_bytes)
 
@@ -347,5 +454,6 @@ st.download_button(
     mime="application/pdf"
 )
 
+# Tabla
 st.markdown("### 📋 Vista previa de datos")
-st.dataframe(df.head(100), use_container_width=True)
+st.dataframe(df.head(1000), use_container_width=True)

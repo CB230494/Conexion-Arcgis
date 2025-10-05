@@ -349,3 +349,5 @@ to_excel_download(st.session_state.df_clean, filename="datos_limpios.xlsx", key=
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(st.session_state.df_clean.head(1000), use_container_width=True)
 
+
+

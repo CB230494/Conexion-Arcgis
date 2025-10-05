@@ -342,11 +342,15 @@ if not dupes_now.empty:
         })
 
 # ======== PDF con Platypus (ajuste de texto) ========
-def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png_bytes: bytes | None, mapa_final_png_bytes: bytes | None) -> bytes:
+def build_pdf(conteos: dict, detalle_dupes: list,
+              mapa_dup_png_bytes: bytes | None,
+              mapa_final_png_bytes: bytes | None) -> bytes:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            leftMargin=2*cm, rightMargin=2*cm,
-                            topMargin=2*cm, bottomMargin=2*cm)
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm
+    )
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="H1b", parent=styles["Heading1"], fontName="Helvetica-Bold"))
     styles.add(ParagraphStyle(name="H2b", parent=styles["Heading2"], fontName="Helvetica-Bold"))
@@ -381,11 +385,12 @@ def build_pdf(conteos: dict, detalle_dupes: list, mapa_dup_png_bytes: bytes | No
             flow.append(Spacer(1, 8))
 
     # Evidencias
-    if mapa_dup_png is not None or mapa_final_png_bytes is not None:
+    if (mapa_dup_png_bytes is not None) or (mapa_final_png_bytes is not None):
         flow.append(Paragraph("Evidencias visuales", styles["H2b"]))
 
     def add_img(png_bytes, caption):
-        if not png_bytes: return
+        if not png_bytes:
+            return
         img = ImageReader(io.BytesIO(png_bytes))
         iw, ih = img.getSize()
         max_w = A4[0] - 4*cm
@@ -426,5 +431,4 @@ st.download_button(
 # ======== Tabla rápida ========
 st.markdown("### 📄 Datos (primeras filas)")
 st.dataframe(df.head(1000), use_container_width=True)
-
 

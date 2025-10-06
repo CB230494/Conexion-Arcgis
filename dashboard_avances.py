@@ -4,6 +4,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import uuid
 
 # Mapa
 import folium
@@ -253,10 +254,10 @@ else:
 
         to_excel_download(df, filename="datos_limpios.xlsx", key="dl_excel_limpio")
 
-# ======== MAPA ========
+# ======== Mapa ========
 st.markdown("### 🗺️ Mapa (duplicadas en rojo)")
 
-# Puntos válidos (corrección de dropna/columnas)
+# Puntos válidos
 valid_points = df.copy()
 for c in [lat_col, lon_col]:
     if c in valid_points.columns:
@@ -269,7 +270,7 @@ dup_set = {i for lst in dupes_now["indices"] for i in lst} if not dupes_now.empt
 center_lat, center_lon = center_from_points(valid_points, lon_col, lat_col)
 m = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
 
-# Capas base (todas con attribution correcto)
+# Capas base
 folium.TileLayer(
     tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
     name="OpenStreetMap",
@@ -358,7 +359,7 @@ if not dupes_now.empty:
             "motivo": motivo
         })
 
-# ======== PDF (cuadro resumen + evidencias: duplicadas y final en páginas separadas) ========
+# ======== PDF (cuadro resumen + evidencias) ========
 def build_pdf(title, conteos, detalle_dupes, dup_png_bytes, final_png_bytes):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
@@ -366,6 +367,9 @@ def build_pdf(title, conteos, detalle_dupes, dup_png_bytes, final_png_bytes):
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], leading=14))
 
+    flow = []
+    flow.append(Paragraph(title, styles["Heading1"])))
+    # ^^^ pequeña corrección de paréntesis más abajo (línea correcta):
     flow = []
     flow.append(Paragraph(title, styles["Heading1"]))
     flow.append(Paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Body"]))
@@ -400,14 +404,14 @@ def build_pdf(title, conteos, detalle_dupes, dup_png_bytes, final_png_bytes):
     else:
         flow.append(Paragraph("No se detectaron respuestas duplicadas. Todas están validadas.", styles["Body"]))
 
-    # Evidencias (cada imagen en su propia página; la sección inicia en nueva página)
+    # Evidencias
     if dup_png_bytes or final_png_bytes:
         flow.append(PageBreak())
         flow.append(Paragraph("Evidencias visuales", styles["Heading2"]))
         flow.append(Spacer(1, 6))
 
         max_w = A4[0] - 4*cm
-        max_h = A4[1] / 2.0  # más contenido respirando
+        max_h = A4[1] / 2.0
 
         def add_scaled_img(png_bytes, caption):
             imgR = ImageReader(io.BytesIO(png_bytes))
@@ -451,4 +455,108 @@ st.download_button(
 # Tabla
 st.markdown("### 📋 Vista previa de datos")
 st.dataframe(df.head(1000), use_container_width=True)
+
+# ===================== ENCUESTA CON CONDICIONALES (DEMO) =====================
+st.markdown("---")
+st.markdown("## 🧩 Encuesta con condicionales (demo)")
+
+# Mapeos de Canton → Distritos (puedes ampliar libremente)
+CANTON_DISTRICTS = {
+    "Alajuela (Central)": [
+        "Alajuela", "San José", "Carrizal", "San Antonio", "Guácima",
+        "San Isidro", "Sabanilla", "San Rafael", "Río Segundo",
+        "Desamparados", "Turrúcares", "Tambor", "Garita", "Sarapiquí"
+    ],
+    "Sabanilla": [  # si te refieres a distrito/centro poblado independiente
+        "Centro", "Este", "Oeste", "Norte", "Sur"
+    ],
+    "Desamparados": [
+        "Desamparados", "San Miguel", "San Juan de Dios", "San Rafael Arriba",
+        "San Antonio", "Frailes", "Patarrá", "San Cristóbal",
+        "Rosario", "Damas", "San Rafael Abajo", "Gravilias", "Los Guido"
+    ],
+}
+
+INCIDENTES = [
+    "Robo", "Violencia intrafamiliar", "Venta de drogas",
+    "Disturbios", "Sin novedad", "Otro"
+]
+
+# Estado de respuestas almacenadas en sesión
+if "survey_responses" not in st.session_state:
+    st.session_state.survey_responses = []
+
+with st.form("form_encuesta_condicional"):
+    st.markdown("#### 1) Ubicación")
+    canton = st.selectbox("Cantón", list(CANTON_DISTRICTS.keys()))
+    distrito = None
+    if canton:
+        distrito = st.selectbox("Distrito", CANTON_DISTRICTS.get(canton, []))
+
+    st.markdown("#### 2) Incidente")
+    tiene_incidente = st.radio("¿El reporte tiene incidente?", ["Sí", "No"], horizontal=True)
+
+    finalizar_ya = False
+    tipo_incidente = None
+    incidente_otro = ""
+    requiere_seguimiento = None
+    observ = ""
+
+    # Si no hay incidente, ofrecemos finalizar en ese punto
+    if tiene_incidente == "No":
+        st.info("Si no hay incidente, puedes finalizar y enviar ahora.")
+        finalizar_ya = st.checkbox("Finalizar y enviar ahora")
+
+    else:
+        # Sí hay incidente → mostramos más campos
+        tipo_incidente = st.selectbox("Tipo de incidente", INCIDENTES)
+        if tipo_incidente == "Otro":
+            incidente_otro = st.text_input("Especifica el incidente")
+
+        if tipo_incidente == "Sin novedad":
+            st.info("Seleccionaste *Sin novedad*. Puedes finalizar y enviar ahora.")
+            finalizar_ya = st.checkbox("Finalizar y enviar ahora")
+
+        st.markdown("#### 3) Seguimiento")
+        requiere_seguimiento = st.radio("¿Requiere seguimiento?", ["Sí", "No"], horizontal=True)
+        if requiere_seguimiento == "No":
+            st.info("No requiere seguimiento. Puedes finalizar y enviar en este punto si lo deseas.")
+            finalizar_ya = st.checkbox("Finalizar y enviar ahora", value=finalizar_ya)
+
+        st.markdown("#### 4) Observaciones")
+        observ = st.text_area("Observaciones (opcional)", placeholder="Notas breves...")
+
+    enviado = st.form_submit_button("Enviar respuesta")
+
+if enviado:
+    # Construimos el registro respetando lo visible/oculto
+    registro = {
+        "id": str(uuid.uuid4())[:8],
+        "fecha_envio": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "canton": canton,
+        "distrito": distrito,
+        "tiene_incidente": tiene_incidente,
+        "tipo_incidente": tipo_incidente if tiene_incidente == "Sí" else None,
+        "incidente_otro": incidente_otro if (tiene_incidente == "Sí" and tipo_incidente == "Otro") else None,
+        "requiere_seguimiento": requiere_seguimiento if tiene_incidente == "Sí" else None,
+        "observaciones": observ if tiene_incidente == "Sí" else None,
+        "finalizado_temprano": finalizar_ya or (tiene_incidente == "No") or (tipo_incidente == "Sin novedad" if tipo_incidente else False),
+    }
+    st.session_state.survey_responses.append(registro)
+    st.success("✅ Respuesta registrada (demo).")
+
+# Mostrar y descargar respuestas capturadas (demo)
+if st.session_state.survey_responses:
+    st.markdown("#### Respuestas capturadas (demo)")
+    demo_df = pd.DataFrame(st.session_state.survey_responses)
+    st.dataframe(demo_df, use_container_width=True)
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        demo_df.to_excel(writer, index=False, sheet_name="respuestas_encuesta")
+    bio.seek(0)
+    st.download_button("⬇️ Descargar respuestas de encuesta (Excel)", data=bio,
+                       file_name="respuestas_condicionales_demo.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
